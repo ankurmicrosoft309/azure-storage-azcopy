@@ -203,7 +203,11 @@ func (c *Client) Copy(ctx context.Context, src, dest string, opts CopyOptions) (
 		if err != nil {
 			return CopyResult{}, err
 		}
+
+		telemetryAgent := getTelemetryAgent()
+		telemetryDims := copyJobDimensions(t.opts, t.trp.srcCredType, t.trp.dstCredType, c.capMbps)
 		if !t.opts.dryrun {
+			telemetryAgent.reportStarted(telemetryDims, jobID.String(), timeAtPrestart)
 			common.GetLifecycleMgr().Info("Scanning...")
 			mgr.InitiateProgressReporting(ctx, t.tpt)
 		}
@@ -240,6 +244,8 @@ func (c *Client) Copy(ctx context.Context, src, dest string, opts CopyOptions) (
 			ListJobSummaryResponse: finalSummary,
 			ElapsedTime:            t.tpt.GetElapsedTime(),
 		}
+
+		telemetryAgent.reportFinished(buildFinishedEvent(telemetryAgent.resource, telemetryDims, jobID.String(), timeAtPrestart, time.Now(), finalSummary, result.ElapsedTime))
 
 		if common.AzcopyCurrentJobLogger != nil {
 			common.AzcopyCurrentJobLogger.Log(common.LogInfo, GetCopyResult(result, true))

@@ -179,7 +179,10 @@ func (c *Client) Sync(ctx context.Context, src, dest string, opts SyncOptions) (
 		return SyncResult{}, err
 	}
 
+	telemetryAgent := getTelemetryAgent()
+	telemetryDims := syncJobDimensions(s.opts, s.srp.srcCredType, s.srp.dstCredType, c.capMbps)
 	if !s.opts.dryrun {
+		telemetryAgent.reportStarted(telemetryDims, jobID.String(), timeAtPrestart)
 		mgr.InitiateProgressReporting(ctx, s.spt)
 	}
 	err = enumerator.Enumerate()
@@ -219,6 +222,8 @@ func (c *Client) Sync(ctx context.Context, src, dest string, opts SyncOptions) (
 		DeleteTransfersCompleted: s.spt.getDeletionCount(),
 		ElapsedTime:              s.spt.GetElapsedTime(),
 	}
+
+	telemetryAgent.reportFinished(buildFinishedEvent(telemetryAgent.resource, telemetryDims, jobID.String(), timeAtPrestart, time.Now(), finalSummary, result.ElapsedTime))
 
 	if common.AzcopyCurrentJobLogger != nil {
 		common.AzcopyCurrentJobLogger.Log(common.LogInfo, GetSyncResult(result, true))
