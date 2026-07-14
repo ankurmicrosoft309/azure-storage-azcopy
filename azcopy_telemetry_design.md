@@ -7,7 +7,7 @@ AzCopy (Azure/azure-storage-azcopy) is an open-source command-line utility for c
 AzCopy works by calling dataplane Azure Storage APIs, typically via the Azure Storage SDKs for Go. We add a header with every request of the form `User-Agent: AzCopy/10.24.0 azsdk-go-azblob/v1.3.1 (go1.19.12; Windows_NT)`, which helps collect some data about AzCopy usage on the server side. Example of using this can be accessed here: https://aka.ms/BlobClientTools (Ask Vishnu Charan TJ for access)
 
 Storage Mover is an Azure cloud service which helps manage the transfer of data from and to different locations. It internally uses AzCopy. We collect metrics for Storage Mover, which can be accessed here: https://storagemoverprod-aaa9f9c6eyh6e7ex.eus.grafana.azure.com/dashboards/f/tpjJBAG4z/storage-mover-monitoring
- 
+
 ## Problem statement 
 
 Add client side telemetry/metrics collection to the AzCopy command line tool which will help us identify how customers are using AzCopy and its trends in usage over time.
@@ -50,7 +50,9 @@ The focus is on setting up a pipeline which is reliable and scalable and can hel
 - Engineer: Ankur Sharma
 
 ## Technical Design 
- 
+
+![AzCopy telemetry architecture: the AzCopy CLI binary on a customer-managed VM sends HTTP POST telemetry to an Application Insights endpoint in a Microsoft subscription (feeding dashboards), while the data path uses Entra ID auth to the Azure Storage endpoint in the customer subscription.](images/telemetry-design-20260630-135449.png)
+
 We plan to use a global Application Insights backend for collecting the metrics, provisioned as **two instances within a single dedicated subscription** — one **Test** instance fed only by the E2E pipeline, and one **Prod** instance fed by preview and GA builds (see [Staging the Application Insights instance](#staging-the-application-insights-instance-environments)). This subscription is dedicated to telemetry and has nothing to do with the customer's subscription. 
  
 ### Why Azure Monitor is a defensible metrics backend 
@@ -91,37 +93,39 @@ With 1% sampling rate, this will be about $4000/month
 
 ### Subscription
  
-We can use a single global non-customer-specific subscription in Azure to receive and store the metric data. 
+We can use a single global non-customer-specific subscription in Azure to receive and store the metric data. Seanmcc@microsoft.com is the contact person for this subscription (called Xclient).
 
 Within that subscription we will provision **two Application Insights instances**: one **Test** instance that only receives synthetic telemetry from the E2E pipeline, and one **Prod** instance that receives real (sampled) telemetry from both preview/early-adopter and GA builds. Each instance gets its own connection string, which is embedded into the corresponding AzCopy build, so test telemetry never mixes with real customer telemetry. See [Staging the Application Insights instance (environments)](#staging-the-application-insights-instance-environments) for the detailed rationale and isolation options. 
  
 We have to do a privacy review with related teams with PM help and agree that no privacy-sensitive data is saved. 
- 
-Seanmcc@microsoft.com is the contact person for this. 
  
 ### Staging the Application Insights instance (environments) 
 
 Because the App Insights **connection string is embedded in the AzCopy binary** (see Authorization), the telemetry backend is staged primarily by *which connection string a given build embeds*, not by a runtime config. This gives us a clean, low-cost way to separate test traffic from real customer traffic. Recommended approach: 
 
 - **Provision two App Insights resources**, each with its own connection string / instrumentation key, both defined in the same Bicep/ARM template and deployed with an environment parameter: 
-  - **Test** — target of the E2E pipeline. Receives only synthetic telemetry from automated test runs. Lets us validate ingestion, schema, and dashboards without polluting real data. 
-  - **Prod** — target of both the **preview/early-adopter** build and the **GA** build. Receives real (sampled) telemetry. The preview build is the controlled-exposure ("canary") phase against this same instance — exposure is bounded by the small preview audience plus the 1% sampling rate — and the GA build then ramps the same instance to the full installed base. 
-  The preview and GA builds embed the **Prod** connection string; only automated E2E runs use the **Test** connection string. Synthetic test telemetry never mixes with real customer telemetry. 
-- **Isolation options (in increasing order of separation):** 
-  1. Two App Insights resources within the same resource group (simplest, shared RBAC/cost view). 
-  2. Separate resource groups for Test vs Prod (cleaner cost attribution and access control). 
-  3. Separate subscriptions for Prod vs non-Prod (strongest blast-radius and quota isolation; matches how many Microsoft services separate prod/non-prod). 
-- **Alternative (single instance + dimension):** a single App Insights resource where every event carries an `Environment` attribute (we already emit resource attributes, so this is cheap to add). This is the lowest-cost option but mixes test and prod data in one resource, complicating cost accounting, RBAC, retention, and bogus-data filtering. Prefer two separate resources — App Insights has no fixed per-instance cost, you pay per GB ingested, so a low-traffic Test instance is nearly free. 
-- **Region staging:** App Insights has no deployment-slot concept, but the Bicep template can be rolled out region-by-region (or you can start Prod in a single region) to bound early ingestion. 
-- **Promotion** is by *build ring against the same Prod instance* — preview build (small audience + 1% sampling) → GA build (full audience) — validating ingestion and dashboards before ramping. The Test instance is provisioned once and only ever fed by E2E. 
+  - **Test** — target of the E2E pipeline. Receives only synthetic telemetry from automated test runs. Lets us validate ingestion, schema, and dashboards without polluting real data.
+  - **Prod** — target of both the **preview/early-adopter** build and the **GA** build. Receives real (sampled) telemetry. The preview build exposure is bounded by the small preview audience plus the 1% sampling rate — and the GA build then ramps the same instance to the full installed base but still with 1% sampling.
+
+We can have have separate resource groups but on the same subscription for Test vs Prod (cleaner cost attribution and access control).
+
+### Provisioning approach (IaC + pipeline) 
+
+The two Application Insights instances are provisioned with a **Bicep template driven by a dedicated, manually-triggered Azure DevOps pipeline** — not as part of CI or the release pipeline. 
+
+**Why this shape:** 
+- The repo has **no existing IaC**; all Azure interaction is via ADO pipelines authenticated by **workload-identity service connections** (e.g. `azcopy-release`, `azcopytestworkloadidentity`). This approach follows that established convention. 
+- Provisioning is a **rare, near-one-time** infrastructure task. Putting it in `azure-pipelines.yml` (runs on every PR/push) or `build-1es-pipeline.yaml` (build → sign → publish) would risk accidental re-deploys and couple infra lifecycle to code lifecycle. A separate `trigger: none, pr: none` pipeline (mirroring `e2e-cleanup.yml`) keeps it isolated and explicit. 
+- **Bicep over raw ARM JSON:** Bicep is the modern Azure IaC, compiles to ARM, and is far less verbose for ~2 resources. 
+- **Bicep over EV2:** EV2 (Express v2 / Safe Deployment Practices) is warranted only if the owning team mandates EV2 for all Azure resources, or if multi-region staged rollout with automated health gates is required. For two low-churn App Insights instances it is heavyweight (ServiceModel / RolloutSpec / ScopeBindings, EV2 onboarding, ServiceTree registration). We start with Bicep; if compliance later requires EV2, EV2 can deploy the same Bicep/ARM, so the work is not wasted. **Decision point:** confirm with EM whether the telemetry subscription falls under an EV2/SDP mandate. 
 
 ### Azure Monitor OpenTelemetry Exporter 
  
 AzCopy is written in Go. Use the industry-standard, vendor-neutral OpenTelemetry SDK. Add an exporter as a code component in the same binary which receives OTel data and forwards it to Application Insights. It ultimately does a POST request to the `/v2.1/track` endpoint of App Insights. 
  
-POC standalone Go binary sending metrics to Application Insights: go-scratchpad/metrics/metrics.go at main · sharankur_microsoft/go-scratchpad 
+POC standalone Go binary sending metrics to Application Insights: go-scratchpad/metrics/metrics.go at main · sharankur_microsoft/go-scratchpad
  
-## Authorization 
+### Authorization 
  
 Authorization to Application Insights can be done in two ways: standard AAD and connection-string based. 
  
@@ -134,97 +138,27 @@ Authorization to Application Insights can be done in two ways: standard AAD and 
 
 The proposed solution is to hardcode/embed the connection string of the environment-appropriate Application Insights resource (**Test** for E2E runs, or **Prod** for preview and GA builds — see [Staging the Application Insights instance](#staging-the-application-insights-instance-environments)) hosted in the XClient subscription into the open-source AzCopy binary and use it to send client-side metrics. Each build embeds the connection string of its corresponding instance. 
  
-The pitfall is that anyone who can extract the connection string will be able to send bogus metrics to Application Insights. However, they will not be able to read any metrics data just based on a connection string. 
- 
+The pitfall is that anyone who can extract the connection string will be able to send bogus metrics to Application Insights. However, they will not be able to read any metrics data just based on a connection string.
+
+With security consultation, we concluded that this approach is viable as long as we are able to 1) Maintain our rate limits so that the ingestion and storage costs dont explode because of bogus data 2) detect and filter out bogus data using heuristics
+
 Azure CLI and Azurite are two other open-source projects using publicly accessible connection strings for sending metrics to Application Insights. 
  
-### Is it possible to use customer Entra ID identity to send metrics to Application Insights? 
- 
-Likely not possible. The telemetry backend is a Microsoft-owned Application Insights resource in a separate subscription. To use Entra ID for telemetry ingestion, the caller identity must be granted the Monitoring Metrics Publisher role on that specific Application Insights resource. 
- 
 ### How to differentiate between bogus data and genuine data? 
- 
-Heuristics: 
- 
+  
 - Compare that we received a corresponding number of requests on Azure Storage data plane APIs for the duration of the job run 
 - Count and relative timings of start job metric events and finish job metric events should make sense 
 - Discard wrong schema 
 
-## Exact metrics being sent 
+### Exact metrics being sent 
 
 Each event is sent to Application Insights as a single `Microsoft.ApplicationInsights.Metric` envelope. The numeric data points live under `data.baseData.metrics`, and all resource attributes + job dimensions are sent once as a shared `data.baseData.properties` bag (all property values are strings). The `job.started` and `job.finished` events for one run share the same `RunID` so they can be correlated.
 
-The examples below are generated directly from the AzCopy serialization code (an on-prem-style block-blob upload from local disk to a public-cloud Blob account, with a few failed transfers).
+The example below is generated directly from the AzCopy serialization code (an on-prem-style block-blob upload from local disk to a public-cloud Blob account, with a few failed transfers).
 
-### Event 1 — `azcopy.job.started`
+#### Event 2 — `azcopy.job.finished`
 
-```json
-{
-  "name": "Microsoft.ApplicationInsights.Metric",
-  "time": "2026-06-25T14:30:00Z",
-  "iKey": "00000000-0000-0000-0000-000000000000",
-  "data": {
-    "baseType": "MetricData",
-    "baseData": {
-      "metrics": [
-        {
-          "name": "azcopy.job.started",
-          "value": 1,
-          "count": 1
-        }
-      ],
-      "properties": {
-        "BlobType": "BlockBlob",
-        "CloudType": "public",
-        "Command": "copy",
-        "DestAuthMechanism": "OAuthToken",
-        "DestEndpointKind": "public",
-        "DestProtocol": "https",
-        "DestStorageAccount": "mystorageacct",
-        "DestType": "Blob",
-        "FromTo": "LocalBlob",
-        "GeoCountry": "United States",
-        "GeoRegion": "eastus",
-        "GeoTimezone": "America/New_York",
-        "HostArch": "amd64",
-        "HostCPUModel": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "HostMemoryTotalGB": "32",
-        "HostNICSpeedMbps": "10000",
-        "HostNumCPU": "8",
-        "HostVirtualization": "azure-vm",
-        "InstallationID": "8f14e45fceea167a5a36dedd4bea2543",
-        "InvocationContext": "ci",
-        "NetworkRunContext": "azure-vm",
-        "OSType": "linux",
-        "OSVersion": "Ubuntu 22.04.3 LTS",
-        "OptBlockSizeMB": "8",
-        "OptCapMbps": "false",
-        "OptConcurrency": "32",
-        "OptFlagsSet": "recursive,put-md5,block-size-mb,block-blob-tier",
-        "OptOverwrite": "true",
-        "OptPreserveSMBPermissions": "false",
-        "OptPutMD5": "true",
-        "OptRecursive": "true",
-        "RequestedAccessTier": "Cool",
-        "RunID": "b3f2c1a4-9d5e-4f8a-bc12-3456789abcde",
-        "ServiceName": "azcopy",
-        "ServiceVersion": "10.32.2",
-        "SourceAuthMechanism": "Anonymous",
-        "SourceMountType": "local-disk",
-        "SourceProtocol": "local",
-        "SourceStorageAccount": "",
-        "SourceType": "Local",
-        "TransferDirection": "upload",
-        "TransferTopology": "intra-azure"
-      }
-    }
-  }
-}
-```
-
-### Event 2 — `azcopy.job.finished`
-
-The finished event carries the same property bag plus `JobStatus` and (when there were failures) `FailureErrorCodes`, and adds all the numeric measurements.
+The finished event carries the same property bag as started event plus `JobStatus` and (when there were failures) `FailureErrorCodes`, and adds all the numeric measurements.
 
 ```json
 {
@@ -352,23 +286,19 @@ The finished event carries the same property bag plus `JobStatus` and (when ther
 }
 ```
 
-## Timing of metrics being sent 
- 
+### Timing of metrics being sent 
+
 We can send metrics in two batches: one at the start of the process with details about source, target, platform, CLI options, subcommand, etc.; and one at the end with number of objects, number of bytes transferred, number of failures, latency stats, etc. 
  
 This allows us to get some information even if the AzCopy command does not run to completion, for example due to crash or being killed. 
  
 ### Error handling and failure mode 
- 
-HTTP 429 and 503 can be retried asynchronously a couple of times with exponential backoff and jittering. Permanent failures like DNS error, bad configuration, or authorization error should not be retried. 
- 
+
+HTTP 429 and 503 can be retried asynchronously a couple of times with exponential backoff and jittering. Permanent failures like DNS error, bad configuration, or authorization error should not be retried.
+
 ### Does AzCopy stall if Azure Monitor throttles? 
  
-No. The exporter path should run in a separate asynchronous pipeline. Go has the concept of goroutines, which should make this easier to program. We should perform batching and send metrics network requests in a batch. We can queue the batches and prefer to drop batches if the queue is full. 
- 
-### Backoff policy 
- 
-Use exponential backoff with jitter for retryable failures, with a max cap of maybe three retries. 
+No. The exporter path should run in a separate asynchronous pipeline. Go has the concept of goroutines, which should make this easier to program.
  
 ### How the error is surfaced to the customer 
  
@@ -378,15 +308,28 @@ Non-fatal warning in debug/verbose logs, but it should not fail the AzCopy comma
  
 We can expose a command-line option to turn off telemetry, but it should be on by default. Otherwise, customer adoption and data will be low. Retry policy, bounded buffering, and dropping telemetry when needed should make it so customers do not have to think about this. 
  
-### Local caching / buffering 
- 
-Not required to cache or buffer the metrics. AzCopy CLI is a short-lived process and we need to dispatch metrics immediately upon job start and job finish. 
- 
 ### Competing for resources with AzCopy 
  
 Investigate how much additional memory usage is added by metrics collection and whether it can be turned on without significant impact, for example no more than 100 KB. 
  
-# Timelines
+## Timelines
+
+Action items:
+
+M1 - emitting in PPE - by end of the month
+M2 - Provisioning resources in Prod
+
+- Go over Production timelines for Mover - Sync up with Shilpa
+- Single meeting for Azcopy with relevant people - 
+- Too aggressive timelines
+- New subscription in AME
+
+- Separate the timlines from design doc. Dont publish timelines publically yet.
+- Written confirmation for security review approval
+- Focus on regressions - Azcopy - Sashank & Adele - Common forum (create a recurring meeting and teams space)
+- Preview release might not be necessary
+- Security review with Thread Model updated
+
 
 | Category | Activity | Owner | ETA | Comments |
 |---|---|---|---|---|
@@ -408,20 +351,10 @@ Investigate how much additional memory usage is added by metrics collection and 
 | Milestone | M2 — E2E testing validated in Test environment / preview build (Canary SignOff) — telemetry backend validated end-to-end via E2E pipeline; client shipped as a GitHub **prerelease/preview** build with sampling at 1% as the controlled-exposure knob | Ankur | 23/07/2026 |  |
 | Milestone | M3 — Production deployment and signoff — promote prerelease to GA release across all channels (download/version-check container, GitHub release, Docker/ACR, Linux PMC repos) (date depends on AzCopy's release cadence — stable minors ship ~quarterly, with a ~1–2 month preview→GA soak window) | Ankur | --/--/2026 |  |
 |
-# Staggered rollout 
+
+### Staggered rollout 
  
 Start deployment with a minimum sampling rate of 1%. Observe ingestion rates and costs. We can also do this by geography to start with, for example roll it out only for EMEA. Depending on costs and confidence in metrics, increase sampling rate to 5% or 10% in the next rollout, and then add more geographies. 
-
-## How this maps to AzCopy's actual release process
-
-AzCopy is a **client-side CLI**, not a hosted service, so there is no blue/green canary fleet or deployed environment to soak. The release pipeline (`build-1es-pipeline.yaml`) is a manually-triggered build → ESRP sign → verify → publish pipeline (run off `refs/tags/release`) that pushes binaries to four independent channels: the download/version-check storage container (powers `azcopy --check-version`), GitHub releases, Docker images on ACR, and the Linux package repositories via PMC (apt/yum). Each channel is gated by its own pipeline parameter, so publishing can be staged channel-by-channel.
-
-Given that, the "canary" and "soak" for AzCopy are achieved through two knobs rather than a separate environment:
-
-1. **Prerelease / preview build (the canary ring).** The pipeline can publish a build as a GitHub **prerelease** (`prerelease`/`draft` parameters) before promoting it to a full GA release. Early adopters run the preview build first; we observe telemetry ingestion and correctness, then promote to GA. This prerelease-then-promote window is the effective soak period — it is process-driven, not a fixed time gate in the pipeline.
-2. **Sampling rate (controlled exposure).** Even on a GA build, the 1% default sampling rate limits how much of the installed base actually emits metrics, so the blast radius is bounded independently of which build is published. We ramp sampling (1% → 5% → 10%) and/or geography as confidence grows.
-
-Rollback, if a bad telemetry build reaches production, is handled by the pipeline's `RemovePackagesFromLinuxRepository` stage for Linux repos and by replacing the published binary/GitHub release for the other channels. The `--disable-telemetry` flag (and the opt-out env var) provide an additional customer-side kill switch.
 
 # Appendix
 

@@ -1,0 +1,81 @@
+# Manual pipeline to provision the AzCopy telemetry Application Insights backend.
+#
+# This is infrastructure lifecycle, NOT build/test/release, so it is deliberately
+# kept out of azure-pipelines.yml (CI) and build-1es-pipeline.yaml (release).
+# Run it on demand to create or update the Test / Prod App Insights instances.
+#
+# Prerequisites (one-time):
+#   - A workload-identity-federated ADO service connection (see serviceConnection
+#     parameter below) with Contributor on the target subscription / resource group.
+#   - The target subscription id.
+# After a successful run, copy the 'connectionString' deployment output into the
+# matching AzCopy build configuration (test build for E2E, prod build for releases).
+
+trigger: none
+pr: none
+
+parameters:
+  - name: environmentName
+    displayName: 'Environment to provision'
+    type: string
+    default: 'test'
+    values:
+      - test
+      - prod
+
+  - name: serviceConnection
+    displayName: 'ADO service connection (workload identity) with Contributor on the target subscription'
+    type: string
+    default: 'azcopy-telemetry-infra'
+
+  - name: subscriptionId
+    displayName: 'Target subscription id'
+    type: string
+
+  - name: resourceGroupName
+    displayName: 'Resource group name (created if it does not exist)'
+    type: string
+    default: 'azcopy-telemetry-rg'
+
+  - name: location
+    displayName: 'Azure region'
+    type: string
+    default: 'eastus'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+  - task: AzureCLI@2
+    displayName: 'Provision App Insights (${{ parameters.environmentName }})'
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+
+        az account set --subscription "${{ parameters.subscriptionId }}"
+
+        echo "Ensuring resource group '${{ parameters.resourceGroupName }}' exists in ${{ parameters.location }}"
+        az group create \
+          --name "${{ parameters.resourceGroupName }}" \
+          --location "${{ parameters.location }}" \
+          --tags service=azcopy-telemetry managedBy=bicep
+
+        echo "Deploying telemetry backend (environment=${{ parameters.environmentName }})"
+        az deployment group create \
+          --resource-group "${{ parameters.resourceGroupName }}" \
+          --name "azcopy-telemetry-${{ parameters.environmentName }}" \
+          --template-file "$(System.DefaultWorkingDirectory)/infra/telemetry/main.bicep" \
+          --parameters "$(System.DefaultWorkingDirectory)/infra/telemetry/${{ parameters.environmentName }}.bicepparam"
+
+        # The connection string is needed to embed into the matching AzCopy build.
+        # It routes telemetry only and is not a secret, but we mark it as a secret
+        # variable here to keep it out of plain build logs by default.
+        connStr=$(az deployment group show \
+          --resource-group "${{ parameters.resourceGroupName }}" \
+          --name "azcopy-telemetry-${{ parameters.environmentName }}" \
+          --query properties.outputs.connectionString.value -o tsv)
+        echo "##vso[task.setvariable variable=telemetryConnectionString;issecret=true]$connStr"
+        echo "Provisioned. Connection string captured in pipeline variable 'telemetryConnectionString'."
