@@ -39,42 +39,54 @@ import (
 // ---------------------------------------------------------------------------
 
 type ResourceAttributes struct {
-	ServiceName        string // "azcopy"
-	ServiceVersion     string // "10.32.2"
-	OSType             string // runtime.GOOS
-	OSVersion          string // uname / RtlGetVersion
-	HostArch           string // runtime.GOARCH
-	HostNumCPU         int    // runtime.NumCPU()
-	HostCPUModel       string // /proc/cpuinfo, WMI, sysctl
-	HostMemoryTotalGB  int    // total physical memory
-	HostNICSpeedMbps   int    // best-effort; -1 when unavailable
-	HostVirtualization string // "azure-vm" | "unknown"
-	GeoRegion          string // IMDS compute.location, else timezone bucket
-	GeoTimezone        string // IANA timezone
-	GeoCountry         string // ISO 3166 country name, e.g. "United States"
-	NetworkRunContext  string // "azure-vm" | "on-prem" | "unknown"
-	InstallationID     string // anonymous, stable per-install identifier (no PII)
-	InvocationContext  string // "interactive" | "ci" | "sdk" | "unknown"
+	ServiceName           string // "azcopy"
+	ServiceVersion        string // "10.32.2"
+	SchemaVersion         string
+	SamplingRate          float64
+	SamplingUnit          string
+	SamplerVersion        string
+	OSType                string // runtime.GOOS
+	OSVersion             string // uname / RtlGetVersion
+	HostArch              string // runtime.GOARCH
+	HostNumCPU            int    // runtime.NumCPU()
+	HostCPUModel          string // /proc/cpuinfo, WMI, sysctl
+	HostMemoryTotalGB     int    // total physical memory
+	HostNICSpeedMbps      int    // best-effort; -1 when unavailable
+	HostNICSpeedAvailable bool
+	HostNICSpeedBucket    string // unknown | <1gbps | 1-<10gbps | 10-<40gbps | >=40gbps
+	HostVirtualization    string // "azure-vm" | "unknown"
+	GeoRegion             string // IMDS compute.location, else timezone bucket
+	GeoTimezone           string // IANA timezone
+	GeoCountry            string // ISO 3166 country name, e.g. "United States"
+	NetworkRunContext     string // "azure-vm" | "on-prem" | "unknown"
+	InstallationID        string // anonymous, stable per-install identifier (no PII)
+	InvocationContext     string // "interactive" | "ci" | "sdk" | "unknown"
 }
 
 func (ra ResourceAttributes) props() map[string]string {
 	return map[string]string{
-		"ServiceName":        ra.ServiceName,
-		"ServiceVersion":     ra.ServiceVersion,
-		"OSType":             ra.OSType,
-		"OSVersion":          ra.OSVersion,
-		"HostArch":           ra.HostArch,
-		"HostNumCPU":         strconv.Itoa(ra.HostNumCPU),
-		"HostCPUModel":       ra.HostCPUModel,
-		"HostMemoryTotalGB":  strconv.Itoa(ra.HostMemoryTotalGB),
-		"HostNICSpeedMbps":   strconv.Itoa(ra.HostNICSpeedMbps),
-		"HostVirtualization": ra.HostVirtualization,
-		"GeoRegion":          ra.GeoRegion,
-		"GeoTimezone":        ra.GeoTimezone,
-		"GeoCountry":         ra.GeoCountry,
-		"NetworkRunContext":  ra.NetworkRunContext,
-		"InstallationID":     ra.InstallationID,
-		"InvocationContext":  ra.InvocationContext,
+		"ServiceName":           ra.ServiceName,
+		"ServiceVersion":        ra.ServiceVersion,
+		"SchemaVersion":         ra.SchemaVersion,
+		"SamplingRate":          strconv.FormatFloat(ra.SamplingRate, 'f', -1, 64),
+		"SamplingUnit":          ra.SamplingUnit,
+		"SamplerVersion":        ra.SamplerVersion,
+		"OSType":                ra.OSType,
+		"OSVersion":             ra.OSVersion,
+		"HostArch":              ra.HostArch,
+		"HostNumCPU":            strconv.Itoa(ra.HostNumCPU),
+		"HostCPUModel":          ra.HostCPUModel,
+		"HostMemoryTotalGB":     strconv.Itoa(ra.HostMemoryTotalGB),
+		"HostNICSpeedMbps":      strconv.Itoa(ra.HostNICSpeedMbps),
+		"HostNICSpeedAvailable": strconv.FormatBool(ra.HostNICSpeedAvailable),
+		"HostNICSpeedBucket":    ra.HostNICSpeedBucket,
+		"HostVirtualization":    ra.HostVirtualization,
+		"GeoRegion":             ra.GeoRegion,
+		"GeoTimezone":           ra.GeoTimezone,
+		"GeoCountry":            ra.GeoCountry,
+		"NetworkRunContext":     ra.NetworkRunContext,
+		"InstallationID":        ra.InstallationID,
+		"InvocationContext":     ra.InvocationContext,
 	}
 }
 
@@ -83,8 +95,44 @@ func (ra ResourceAttributes) props() map[string]string {
 // Present on BOTH events.
 // ---------------------------------------------------------------------------
 
+type OptionAttributes struct {
+	FlagsSet   []string
+	EnvVarsSet []string
+	Values     map[string]string
+}
+
+func (o OptionAttributes) Clone() OptionAttributes {
+	clone := OptionAttributes{
+		FlagsSet:   append([]string(nil), o.FlagsSet...),
+		EnvVarsSet: append([]string(nil), o.EnvVarsSet...),
+	}
+	if len(o.Values) > 0 {
+		clone.Values = make(map[string]string, len(o.Values))
+		for key, value := range o.Values {
+			clone.Values[key] = value
+		}
+	}
+	return clone
+}
+
+func (o OptionAttributes) addTo(props map[string]string) {
+	if len(o.FlagsSet) > 0 {
+		props["OptFlagsSet"] = truncateValue(strings.Join(o.FlagsSet, ","))
+	}
+	if len(o.EnvVarsSet) > 0 {
+		props["OptEnvVarsSet"] = truncateValue(strings.Join(o.EnvVarsSet, ","))
+	}
+	for key, value := range o.Values {
+		if value != "" {
+			props[key] = truncateValue(value)
+		}
+	}
+}
+
 type JobDimensions struct {
 	Command                   string // "copy" | "sync" | "remove"
+	AttemptType               string // original | resume
+	MeasurementScope          string // attempt | job-cumulative
 	FromTo                    string // "LocalBlob", "BlobLocal", "S3Blob", ...
 	SourceType                string // "Local" | "Blob" | "File" | "S3" | ...
 	DestType                  string
@@ -93,52 +141,63 @@ type JobDimensions struct {
 	SourceProtocol            string // "smb" | "nfs" | "local" | "https" | "s3" | "gcs"
 	SourceMountType           string // "nas-smb" | "nas-nfs" | "local-disk" | "cloud-azure" | ...
 	SourceStorageAccount      string // Azure account name OR S3/GCP bucket name; HIGH cardinality (empty for local)
+	SourceEndpointIdentity    string // sanitized scheme://host[:non-default-port] fallback when account/bucket is unavailable
+	SourceScope               string // service | container | share | bucket | object-or-prefix | local-* | stream | benchmark
 	DestProtocol              string
 	DestStorageAccount        string // Azure account name OR S3/GCP bucket name; HIGH cardinality
+	DestEndpointIdentity      string
+	DestScope                 string
 	DestEndpointKind          string // "public" | "private-endpoint"
 	CloudType                 string // "public" | "gov" | "china" | "germany"
 	SourceAuthMechanism       string // "OAuthToken" | "Anonymous" | "SharedKey" | ...
 	DestAuthMechanism         string // "OAuthToken" | "Anonymous" | "SharedKey" | ...
-	BlobType                  string // "BlockBlob" | "PageBlob" | "AppendBlob" | "Detect"
-	RequestedAccessTier       string // requested --block-blob-tier/--page-blob-tier, "None" when unset
-	OptRecursive              bool
-	OptOverwrite              string // "true" | "false" | "ifSourceNewer" | "prompt"
-	OptCapMbps                bool   // whether --cap-mbps was set (not the value)
-	OptPreserveSMBPermissions bool
-	OptPutMD5                 bool
-	OptBlockSizeMB            int
-	OptConcurrency            int      // effective concurrency (AZCOPY_CONCURRENCY_VALUE)
-	OptFlagsSet               []string // names of non-default CLI flags (no values)
+	BenchmarkMode             string // upload | download
+	BenchmarkFileCount        int64
+	BenchmarkFileSizeBytes    int64
+	BenchmarkFolderCount      int64
+	BenchmarkCleanupRequested bool
+	BenchmarkIsCleanup        bool
+	Options                   OptionAttributes
 }
 
 func (jd JobDimensions) props() map[string]string {
-	return map[string]string{
-		"Command":                   jd.Command,
-		"FromTo":                    jd.FromTo,
-		"SourceType":                jd.SourceType,
-		"DestType":                  jd.DestType,
-		"TransferDirection":         jd.TransferDirection,
-		"TransferTopology":          jd.TransferTopology,
-		"SourceProtocol":            jd.SourceProtocol,
-		"SourceMountType":           jd.SourceMountType,
-		"SourceStorageAccount":      jd.SourceStorageAccount,
-		"DestProtocol":              jd.DestProtocol,
-		"DestStorageAccount":        jd.DestStorageAccount,
-		"DestEndpointKind":          jd.DestEndpointKind,
-		"CloudType":                 jd.CloudType,
-		"SourceAuthMechanism":       jd.SourceAuthMechanism,
-		"DestAuthMechanism":         jd.DestAuthMechanism,
-		"BlobType":                  jd.BlobType,
-		"RequestedAccessTier":       jd.RequestedAccessTier,
-		"OptRecursive":              strconv.FormatBool(jd.OptRecursive),
-		"OptOverwrite":              jd.OptOverwrite,
-		"OptCapMbps":                strconv.FormatBool(jd.OptCapMbps),
-		"OptPreserveSMBPermissions": strconv.FormatBool(jd.OptPreserveSMBPermissions),
-		"OptPutMD5":                 strconv.FormatBool(jd.OptPutMD5),
-		"OptBlockSizeMB":            strconv.Itoa(jd.OptBlockSizeMB),
-		"OptConcurrency":            strconv.Itoa(jd.OptConcurrency),
-		"OptFlagsSet":               truncateValue(strings.Join(jd.OptFlagsSet, ",")),
+	props := map[string]string{
+		"Command":                jd.Command,
+		"FromTo":                 jd.FromTo,
+		"SourceType":             jd.SourceType,
+		"DestType":               jd.DestType,
+		"TransferDirection":      jd.TransferDirection,
+		"TransferTopology":       jd.TransferTopology,
+		"SourceProtocol":         jd.SourceProtocol,
+		"SourceMountType":        jd.SourceMountType,
+		"SourceStorageAccount":   jd.SourceStorageAccount,
+		"SourceEndpointIdentity": jd.SourceEndpointIdentity,
+		"SourceScope":            jd.SourceScope,
+		"DestProtocol":           jd.DestProtocol,
+		"DestStorageAccount":     jd.DestStorageAccount,
+		"DestEndpointIdentity":   jd.DestEndpointIdentity,
+		"DestScope":              jd.DestScope,
+		"DestEndpointKind":       jd.DestEndpointKind,
+		"CloudType":              jd.CloudType,
+		"SourceAuthMechanism":    jd.SourceAuthMechanism,
+		"DestAuthMechanism":      jd.DestAuthMechanism,
 	}
+	if jd.AttemptType != "" {
+		props["AttemptType"] = jd.AttemptType
+	}
+	if jd.MeasurementScope != "" {
+		props["MeasurementScope"] = jd.MeasurementScope
+	}
+	if jd.Command == "bench" {
+		props["BenchmarkMode"] = jd.BenchmarkMode
+		props["BenchmarkFileCount"] = strconv.FormatInt(jd.BenchmarkFileCount, 10)
+		props["BenchmarkFileSizeBytes"] = strconv.FormatInt(jd.BenchmarkFileSizeBytes, 10)
+		props["BenchmarkFolderCount"] = strconv.FormatInt(jd.BenchmarkFolderCount, 10)
+		props["BenchmarkCleanupRequested"] = strconv.FormatBool(jd.BenchmarkCleanupRequested)
+		props["BenchmarkIsCleanup"] = strconv.FormatBool(jd.BenchmarkIsCleanup)
+	}
+	jd.Options.addTo(props)
+	return props
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +211,7 @@ type JobStartedEvent struct {
 	// event. Both events for a single run carry the same value (typically the
 	// AzCopy JobID). Emitted as the "RunID" property.
 	RunID        string
+	InvocationID string
 	Timestamp    time.Time
 	StartedCount int64 // monotonic counter increment, always 1
 }
@@ -167,31 +227,75 @@ type JobFinishedEvent struct {
 	// event. Both events for a single run carry the same value (typically the
 	// AzCopy JobID). Emitted as the "RunID" property.
 	RunID          string
+	InvocationID   string
 	StartTimestamp time.Time
 	EndTimestamp   time.Time
 
-	FinishedCount int64  // monotonic counter increment, always 1
-	JobStatus     string // "Completed" | "CompletedWithErrors" | "Failed" | "Cancelled" | ...
+	FinishedCount    int64  // monotonic counter increment, always 1
+	JobStatus        string // "Completed" | "CompletedWithErrors" | "Failed" | "Cancelled" | ...
+	TerminalReason   string // completed | completed-with-errors | cancelled | failed
+	TerminalStage    string // initialization | enumeration | transfer | completion | completed
+	JobErrorCategory string // authentication | authorization | throttling | timeout | network | local-io | conflict | not-found | service | azcopy | initialization | enumeration | transfer | completion | unknown
+	JobErrorCode     string // bounded stable code; never raw error text
 
 	// FailureErrorCodes is a compact, bounded histogram of the error codes seen
 	// across failed transfers, e.g. "403:5,500:2" (ordered by descending count).
 	// Empty when there were no failures. Contains no PII (only numeric codes).
-	FailureErrorCodes string
+	FailureErrorCodes            string
+	FailureErrorOtherCount       int64
+	PerformanceConstraint        string
+	PrimaryPerformanceAdviceCode string
+	PerformanceAdviceCodes       []string
 
 	// Measurements (from ListJobSummaryResponse + ElapsedTime)
-	BytesTransferred   int64   // TotalBytesTransferred (no retries)
-	BytesOverWire      int64   // BytesOverWire (includes retries)
-	TransfersCompleted int64   // TransfersCompleted
-	TransfersFailed    int64   // TransfersFailed
-	TransfersSkipped   int64   // TransfersSkipped
-	TransfersTotal     int64   // TotalTransfers
-	DurationSeconds    float64 // ElapsedTime.Seconds()
-	ThroughputMbps     float64 // BytesTransferred * 8 / 1e6 / DurationSeconds
-	AvgE2ELatencyMs    int64   // AverageE2EMilliseconds
-	AvgIOPS            int64   // AverageIOPS
-	ServerBusyPct      float64 // ServerBusyPercentage
-	NetworkErrorPct    float64 // NetworkErrorPercentage
-	PercentComplete    float64 // PercentComplete (0-100); useful especially for cancelled jobs
+	BytesEnumerated                 int64 // Scheduled source payload bytes after filters
+	BytesExpected                   int64 // Current successful + still-expected payload bytes
+	BytesTransferred                int64 // Logical successful payload bytes; no retry duplication
+	BytesOverWire                   int64 // Physical payload traffic; includes retries and failed-transfer traffic
+	ObjectsScheduled                int64 // File-like payload transfers: regular files/objects, symlinks, and converted hardlinks
+	RegularFilesScheduled           int64 // Regular file/object transfers only
+	SymlinksScheduled               int64 // Preserved symlink transfers
+	HardlinksConvertedScheduled     int64 // Hardlinks scheduled as converted file transfers
+	FolderPropertiesScheduled       int64 // Folder existence/property transfers, not contained files
+	ObjectsCompleted                int64 // Completed payload objects, excluding folder-property transfers
+	ObjectsFailed                   int64 // Failed payload objects, excluding folder-property transfers
+	ObjectsSkipped                  int64 // Skipped payload objects, excluding folder-property transfers
+	FolderPropertiesCompleted       int64
+	FolderPropertiesFailed          int64
+	FolderPropertiesSkipped         int64
+	SourceObjectsScanned            int64
+	SourceBytesScanned              int64
+	SourceAverageObjectSizeBytes    float64
+	SourceObjectSizeP50BytesApprox  int64
+	SourceObjectSizeP90BytesApprox  int64
+	SourceObjectSizeP95BytesApprox  int64
+	SourceObjectsUnder1MiB          int64
+	SourceObjectsUnder1MiBRatioPct  float64
+	SourceMaxDirectoryDepth         int64
+	ContainersScanned               int64
+	ContainersTouched               int64
+	BucketsScanned                  int64
+	BucketsTouched                  int64
+	TransfersCompleted              int64   // TransfersCompleted
+	TransfersFailed                 int64   // TransfersFailed
+	TransfersSkipped                int64   // TransfersSkipped
+	TransfersTotal                  int64   // TotalTransfers
+	JobDurationSeconds              float64 // Entire job attempt, including enumeration/finalization
+	EnumerationPhaseDurationSeconds float64 // Tracker start through final job part dispatch; overlaps transfer
+	TransferPhaseDurationSeconds    float64 // First part ordered through terminal wait; may overlap enumeration
+	JobThroughputMbps               float64 // BytesTransferred * 8 / 1e6 / JobDurationSeconds
+	TransferPhaseThroughputMbps     float64 // BytesTransferred * 8 / 1e6 / TransferPhaseDurationSeconds
+	AverageStorageHTTPAttemptE2EMs  int64   // Mean Storage HTTP attempt duration; retries are separate attempts
+	AvgIOPS                         int64
+	StorageHTTPAttemptCount         int64
+	NetworkErrorAttemptCount        int64
+	ServerBusy503Count              int64
+	ServerBusyThroughputCount       int64
+	ServerBusyIOPSCount             int64
+	ServerBusyOtherCount            int64
+	ServerBusyPct                   float64
+	NetworkErrorPct                 float64
+	PercentComplete                 float64 // PercentComplete (0-100); useful especially for cancelled jobs
 }
 
 // namedMetric is a single numeric measurement to be sent to a backend.
@@ -223,15 +327,38 @@ func (e JobFinishedEvent) timestamp() time.Time { return e.EndTimestamp }
 func (e JobStartedEvent) attributes() map[string]string {
 	attrs := mergeProps(e.Resource.props(), e.Dimensions.props())
 	attrs["RunID"] = e.RunID
+	if e.InvocationID != "" {
+		attrs["InvocationID"] = e.InvocationID
+	}
 	return attrs
 }
 
 func (e JobFinishedEvent) attributes() map[string]string {
 	attrs := mergeProps(e.Resource.props(), e.Dimensions.props())
 	attrs["RunID"] = e.RunID
+	if e.InvocationID != "" {
+		attrs["InvocationID"] = e.InvocationID
+	}
 	attrs["JobStatus"] = e.JobStatus
+	attrs["TerminalReason"] = e.TerminalReason
+	attrs["TerminalStage"] = e.TerminalStage
+	if e.JobErrorCategory != "" {
+		attrs["JobErrorCategory"] = e.JobErrorCategory
+	}
+	if e.JobErrorCode != "" {
+		attrs["JobErrorCode"] = e.JobErrorCode
+	}
 	if e.FailureErrorCodes != "" {
 		attrs["FailureErrorCodes"] = e.FailureErrorCodes
+	}
+	if e.PerformanceConstraint != "" {
+		attrs["PerformanceConstraint"] = e.PerformanceConstraint
+	}
+	if e.PrimaryPerformanceAdviceCode != "" {
+		attrs["PrimaryPerformanceAdviceCode"] = e.PrimaryPerformanceAdviceCode
+	}
+	if len(e.PerformanceAdviceCodes) > 0 {
+		attrs["PerformanceAdviceCodes"] = truncateValue(strings.Join(e.PerformanceAdviceCodes, ","))
 	}
 	return attrs
 }
@@ -245,16 +372,52 @@ func (e JobStartedEvent) measurements() []namedMetric {
 func (e JobFinishedEvent) measurements() []namedMetric {
 	return []namedMetric{
 		{Name: "azcopy.job.finished", Value: float64(e.FinishedCount), Count: 1},
+		{Name: "azcopy.failure_error_other_count", Value: float64(e.FailureErrorOtherCount), Count: 1},
+		{Name: "azcopy.bytes_enumerated", Value: float64(e.BytesEnumerated), Count: 1},
+		{Name: "azcopy.bytes_expected", Value: float64(e.BytesExpected), Count: 1},
 		{Name: "azcopy.bytes_transferred", Value: float64(e.BytesTransferred), Count: 1},
 		{Name: "azcopy.bytes_over_wire", Value: float64(e.BytesOverWire), Count: 1},
+		{Name: "azcopy.objects_scheduled", Value: float64(e.ObjectsScheduled), Count: 1},
+		{Name: "azcopy.regular_files_scheduled", Value: float64(e.RegularFilesScheduled), Count: 1},
+		{Name: "azcopy.symlinks_scheduled", Value: float64(e.SymlinksScheduled), Count: 1},
+		{Name: "azcopy.hardlinks_converted_scheduled", Value: float64(e.HardlinksConvertedScheduled), Count: 1},
+		{Name: "azcopy.folder_properties_scheduled", Value: float64(e.FolderPropertiesScheduled), Count: 1},
+		{Name: "azcopy.objects_completed", Value: float64(e.ObjectsCompleted), Count: 1},
+		{Name: "azcopy.objects_failed", Value: float64(e.ObjectsFailed), Count: 1},
+		{Name: "azcopy.objects_skipped", Value: float64(e.ObjectsSkipped), Count: 1},
+		{Name: "azcopy.folder_properties_completed", Value: float64(e.FolderPropertiesCompleted), Count: 1},
+		{Name: "azcopy.folder_properties_failed", Value: float64(e.FolderPropertiesFailed), Count: 1},
+		{Name: "azcopy.folder_properties_skipped", Value: float64(e.FolderPropertiesSkipped), Count: 1},
+		{Name: "azcopy.source_objects_scanned", Value: float64(e.SourceObjectsScanned), Count: 1},
+		{Name: "azcopy.source_bytes_scanned", Value: float64(e.SourceBytesScanned), Count: 1},
+		{Name: "azcopy.source_average_object_size_bytes", Value: e.SourceAverageObjectSizeBytes, Count: 1},
+		{Name: "azcopy.source_object_size_p50_bytes_approx", Value: float64(e.SourceObjectSizeP50BytesApprox), Count: 1},
+		{Name: "azcopy.source_object_size_p90_bytes_approx", Value: float64(e.SourceObjectSizeP90BytesApprox), Count: 1},
+		{Name: "azcopy.source_object_size_p95_bytes_approx", Value: float64(e.SourceObjectSizeP95BytesApprox), Count: 1},
+		{Name: "azcopy.source_objects_under_1_mib", Value: float64(e.SourceObjectsUnder1MiB), Count: 1},
+		{Name: "azcopy.source_objects_under_1_mib_ratio_pct", Value: e.SourceObjectsUnder1MiBRatioPct, Count: 1},
+		{Name: "azcopy.source_max_directory_depth", Value: float64(e.SourceMaxDirectoryDepth), Count: 1},
+		{Name: "azcopy.containers_scanned", Value: float64(e.ContainersScanned), Count: 1},
+		{Name: "azcopy.containers_touched", Value: float64(e.ContainersTouched), Count: 1},
+		{Name: "azcopy.buckets_scanned", Value: float64(e.BucketsScanned), Count: 1},
+		{Name: "azcopy.buckets_touched", Value: float64(e.BucketsTouched), Count: 1},
 		{Name: "azcopy.transfers_completed", Value: float64(e.TransfersCompleted), Count: 1},
 		{Name: "azcopy.transfers_failed", Value: float64(e.TransfersFailed), Count: 1},
 		{Name: "azcopy.transfers_skipped", Value: float64(e.TransfersSkipped), Count: 1},
 		{Name: "azcopy.transfers_total", Value: float64(e.TransfersTotal), Count: 1},
-		{Name: "azcopy.duration_seconds", Value: e.DurationSeconds, Count: 1},
-		{Name: "azcopy.throughput_mbps", Value: e.ThroughputMbps, Count: 1},
-		{Name: "azcopy.avg_e2e_latency_ms", Value: float64(e.AvgE2ELatencyMs), Count: 1},
+		{Name: "azcopy.job_duration_seconds", Value: e.JobDurationSeconds, Count: 1},
+		{Name: "azcopy.enumeration_phase_duration_seconds", Value: e.EnumerationPhaseDurationSeconds, Count: 1},
+		{Name: "azcopy.transfer_phase_duration_seconds", Value: e.TransferPhaseDurationSeconds, Count: 1},
+		{Name: "azcopy.job_throughput_mbps", Value: e.JobThroughputMbps, Count: 1},
+		{Name: "azcopy.transfer_phase_throughput_mbps", Value: e.TransferPhaseThroughputMbps, Count: 1},
+		{Name: "azcopy.average_storage_http_attempt_e2e_ms", Value: float64(e.AverageStorageHTTPAttemptE2EMs), Count: 1},
 		{Name: "azcopy.avg_iops", Value: float64(e.AvgIOPS), Count: 1},
+		{Name: "azcopy.storage_http_attempt_count", Value: float64(e.StorageHTTPAttemptCount), Count: 1},
+		{Name: "azcopy.network_error_attempt_count", Value: float64(e.NetworkErrorAttemptCount), Count: 1},
+		{Name: "azcopy.server_busy_503_count", Value: float64(e.ServerBusy503Count), Count: 1},
+		{Name: "azcopy.server_busy_throughput_count", Value: float64(e.ServerBusyThroughputCount), Count: 1},
+		{Name: "azcopy.server_busy_iops_count", Value: float64(e.ServerBusyIOPSCount), Count: 1},
+		{Name: "azcopy.server_busy_other_count", Value: float64(e.ServerBusyOtherCount), Count: 1},
 		{Name: "azcopy.server_busy_pct", Value: e.ServerBusyPct, Count: 1},
 		{Name: "azcopy.network_error_pct", Value: e.NetworkErrorPct, Count: 1},
 		{Name: "azcopy.percent_complete", Value: e.PercentComplete, Count: 1},
@@ -264,18 +427,19 @@ func (e JobFinishedEvent) measurements() []namedMetric {
 // ---------------------------------------------------------------------------
 // Event 3: command.invoked
 //
-// Emitted once for commands that do not run a transfer job and therefore do not
-// emit job.started/job.finished (everything except copy and sync), e.g.
-// benchmark, login, logout, remove, resume, list, make, set-properties. It is a
-// lightweight usage signal carrying only the resource attributes plus the
-// command name, so we can answer "which subcommands do customers use?".
+// Emitted once for commands that do not emit paired job-attempt start/finish
+// events. It is a lightweight usage signal carrying only the resource
+// attributes plus the canonical full command path, so we can answer which
+// subcommands customers use without conflating nested commands or aliases.
 // ---------------------------------------------------------------------------
 
 type CommandInvokedEvent struct {
 	Resource ResourceAttributes
-	Command  string // "benchmark" | "login" | "logout" | "remove" | "resume" | ...
+	Command  string // "login" | "jobs.list" | "remove" | ...
+	Options  OptionAttributes
 	// RunID is the AzCopy JobID for this invocation when one exists, else empty.
 	RunID        string
+	InvocationID string
 	Timestamp    time.Time
 	InvokedCount int64 // monotonic counter increment, always 1
 }
@@ -287,8 +451,12 @@ func (e CommandInvokedEvent) timestamp() time.Time { return e.Timestamp }
 func (e CommandInvokedEvent) attributes() map[string]string {
 	attrs := e.Resource.props()
 	attrs["Command"] = e.Command
+	e.Options.addTo(attrs)
 	if e.RunID != "" {
 		attrs["RunID"] = e.RunID
+	}
+	if e.InvocationID != "" {
+		attrs["InvocationID"] = e.InvocationID
 	}
 	return attrs
 }

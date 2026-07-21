@@ -107,6 +107,8 @@ Because the App Insights **connection string is embedded in the AzCopy binary** 
   - **Test** — target of the E2E pipeline. Receives only synthetic telemetry from automated test runs. Lets us validate ingestion, schema, and dashboards without polluting real data.
   - **Prod** — target of both the **preview/early-adopter** build and the **GA** build. Receives real (sampled) telemetry. The preview build exposure is bounded by the small preview audience plus the 1% sampling rate — and the GA build then ramps the same instance to the full installed base but still with 1% sampling.
 
+Pipeline wiring uses secret variables `AZCOPY_TELEMETRY_CONNECTION_STRING_TEST` for E2E binaries and `AZCOPY_TELEMETRY_CONNECTION_STRING_PROD` for official Linux, Windows, and macOS artifacts. The build templates validate the variable and inject it through Go `-ldflags`. Local builds contain no connection string and keep telemetry disabled unless `AZCOPY_TELEMETRY_CONNECTION_STRING` is explicitly set at runtime. The all-zero placeholder is rejected.
+
 We can have have separate resource groups but on the same subscription for Test vs Prod (cleaner cost attribution and access control).
 
 ### Provisioning approach (IaC + pipeline) 
@@ -152,13 +154,13 @@ Azure CLI and Azurite are two other open-source projects using publicly accessib
 
 ### Exact metrics being sent 
 
-Each event is sent to Application Insights as a single `Microsoft.ApplicationInsights.Metric` envelope. The numeric data points live under `data.baseData.metrics`, and all resource attributes + job dimensions are sent once as a shared `data.baseData.properties` bag (all property values are strings). The `job.started` and `job.finished` events for one run share the same `RunID` so they can be correlated.
+Each event is sent to Application Insights as a single `Microsoft.ApplicationInsights.Metric` envelope. The numeric data points live under `data.baseData.metrics`, and all resource attributes + job dimensions are sent once as a shared `data.baseData.properties` bag (all property values are strings). The `job.started` and `job.finished` events for one attempt share the same `RunID` and `InvocationID` so they can be correlated.
 
 The example below is generated directly from the AzCopy serialization code (an on-prem-style block-blob upload from local disk to a public-cloud Blob account, with a few failed transfers).
 
 #### Event 2 — `azcopy.job.finished`
 
-The finished event carries the same property bag as started event plus `JobStatus` and (when there were failures) `FailureErrorCodes`, and adds all the numeric measurements.
+The finished event carries the same property bag as started event plus `JobStatus`, `TerminalReason`, `TerminalStage`, and (when there were transfer failures) `FailureErrorCodes`, and adds all the numeric measurements.
 
 ```json
 {
@@ -175,6 +177,16 @@ The finished event carries the same property bag as started event plus `JobStatu
           "count": 1
         },
         {
+          "name": "azcopy.bytes_enumerated",
+          "value": 5410652160,
+          "count": 1
+        },
+        {
+          "name": "azcopy.bytes_expected",
+          "value": 5381296128,
+          "count": 1
+        },
+        {
           "name": "azcopy.bytes_transferred",
           "value": 5368709120,
           "count": 1
@@ -182,6 +194,26 @@ The finished event carries the same property bag as started event plus `JobStatu
         {
           "name": "azcopy.bytes_over_wire",
           "value": 5402263552,
+          "count": 1
+        },
+        {
+          "name": "azcopy.objects_scheduled",
+          "value": 1295,
+          "count": 1
+        },
+        {
+          "name": "azcopy.objects_completed",
+          "value": 1280,
+          "count": 1
+        },
+        {
+          "name": "azcopy.objects_failed",
+          "value": 3,
+          "count": 1
+        },
+        {
+          "name": "azcopy.objects_skipped",
+          "value": 12,
           "count": 1
         },
         {
@@ -205,23 +237,63 @@ The finished event carries the same property bag as started event plus `JobStatu
           "count": 1
         },
         {
-          "name": "azcopy.duration_seconds",
+          "name": "azcopy.job_duration_seconds",
           "value": 738,
           "count": 1
         },
         {
-          "name": "azcopy.throughput_mbps",
+          "name": "azcopy.transfer_phase_duration_seconds",
+          "value": 700,
+          "count": 1
+        },
+        {
+          "name": "azcopy.job_throughput_mbps",
           "value": 58.2,
           "count": 1
         },
         {
-          "name": "azcopy.avg_e2e_latency_ms",
+          "name": "azcopy.transfer_phase_throughput_mbps",
+          "value": 61.3,
+          "count": 1
+        },
+        {
+          "name": "azcopy.average_storage_http_attempt_e2e_ms",
           "value": 42,
           "count": 1
         },
         {
           "name": "azcopy.avg_iops",
           "value": 173,
+          "count": 1
+        },
+        {
+          "name": "azcopy.storage_http_attempt_count",
+          "value": 127674,
+          "count": 1
+        },
+        {
+          "name": "azcopy.network_error_attempt_count",
+          "value": 255,
+          "count": 1
+        },
+        {
+          "name": "azcopy.server_busy_503_count",
+          "value": 1021,
+          "count": 1
+        },
+        {
+          "name": "azcopy.server_busy_throughput_count",
+          "value": 600,
+          "count": 1
+        },
+        {
+          "name": "azcopy.server_busy_iops_count",
+          "value": 300,
+          "count": 1
+        },
+        {
+          "name": "azcopy.server_busy_other_count",
+          "value": 121,
           "count": 1
         },
         {
@@ -258,6 +330,8 @@ The finished event carries the same property bag as started event plus `JobStatu
         "InstallationID": "8f14e45fceea167a5a36dedd4bea2543",
         "InvocationContext": "ci",
         "JobStatus": "CompletedWithErrors",
+        "JobErrorCategory": "transfer",
+        "JobErrorCode": "transfer-failures",
         "NetworkRunContext": "azure-vm",
         "OSType": "linux",
         "OSVersion": "Ubuntu 22.04.3 LTS",
@@ -286,6 +360,97 @@ The finished event carries the same property bag as started event plus `JobStatu
 }
 ```
 
+Byte metric definitions:
+
+- `bytes_enumerated` is the sum of source sizes for transfers that AzCopy added to job plans after filtering and scheduling decisions. It measures scheduled work, not every object merely scanned. Folder-property transfers normally contribute zero bytes.
+- `bytes_expected` is the current progress denominator. A live in-process job initializes it from all scheduled bytes, so it may still include work that later fails. A summary reconstructed from job plans excludes failed and skipped transfers according to their persisted statuses. Interpret this metric together with `JobStatus`, transfer counts, and whether the event came from a live attempt. On a clean completed job it normally equals `bytes_transferred`.
+- `bytes_transferred` is logical payload progress: bytes successfully completed plus successfully processed bytes in active transfers when a live summary is taken. It excludes failed transfers and does not double-count bytes retransmitted during retries.
+- `bytes_over_wire` is physical payload traffic observed by the transfer engine. It includes duplicate bytes sent or received during retries and traffic for transfers that later fail.
+
+Useful relationships and limitations:
+
+- `bytes_enumerated - bytes_expected` approximates scheduled bytes that are no longer expected to succeed, such as failed or skipped work. Interpret it only after enumeration is complete.
+- `bytes_transferred / bytes_expected` is the basis of percent complete, capped at 100%.
+- `bytes_over_wire - bytes_transferred` is **not** a pure retry-byte metric because it also includes traffic from failed transfers and may reflect protocol behavior. Comprehensive retry-byte accounting needs separate instrumentation.
+- For deletion or folder-only jobs, all byte metrics may legitimately be zero even when many transfers occur.
+
+Object metric definitions:
+
+- A **payload object** is a regular file/cloud object, a preserved symlink, or a hardlink converted and scheduled as a file transfer.
+- A **folder-property transfer** represents creating/preserving a folder's existence and properties. It does not include files contained by that folder and is excluded from payload-object counts.
+- `objects_scheduled` is `total transfers - folder-property transfers` using saturating subtraction.
+- `objects_completed`, `objects_failed`, and `objects_skipped` similarly exclude the corresponding folder-property outcomes.
+- `regular_files_scheduled`, `symlinks_scheduled`, and `hardlinks_converted_scheduled` provide the scheduled payload-object type breakdown. Their sum should equal `objects_scheduled` for a complete, internally consistent summary.
+- `folder_properties_scheduled/completed/failed/skipped` are emitted separately.
+- Existing `transfers_*` metrics remain for compatibility and include both payload objects and folder-property transfers.
+- These are scheduled/transfer outcome counts, not every source or destination object merely scanned. Sync scans both sides and schedules only differences.
+
+Source dataset-shape metrics:
+
+- Shape metrics cover **filtered source payload objects** only: regular files/cloud objects, preserved symlinks, and converted hardlinks. Folder-property entries and destination objects are excluded.
+- `source_objects_scanned` is the denominator for the source shape measurements. For sync, this is the filtered source side regardless of whether source or destination is enumerated first.
+- `source_bytes_scanned` is the exact sum of source sizes for that population, and `source_average_object_size_bytes` is `source_bytes_scanned / source_objects_scanned`.
+- `source_object_size_p50_bytes_approx`, `p90`, and `p95` are approximate percentile upper bounds computed from a fixed histogram with upper bounds at 0 B, 1 KiB, 16 KiB, 256 KiB, 1 MiB, 16 MiB, 256 MiB, 1 GiB, 16 GiB, and the largest observed value. Individual sizes are never retained.
+- `source_objects_under_1_mib` counts source payload objects whose size is strictly less than 1 MiB. `source_objects_under_1_mib_ratio_pct` is that count divided by `source_objects_scanned` times 100.
+- `source_max_directory_depth` is the maximum number of containing segments in a filtered source object's relative path. A root-level object has depth 0; `a/b/file` has depth 2. Both slash styles are recognized, and paths are never emitted.
+
+Source scope metrics:
+
+- `containers_scanned` / `buckets_scanned` count distinct source scopes selected for traversal. A direct single-container/bucket source counts as one; account/service traversal counts the selected scopes returned by the traverser.
+- `containers_touched` / `buckets_touched` count distinct source scopes from which at least one payload object was successfully appended to a job part after compatibility and filtering decisions.
+- Azure Blob containers, ADLS filesystems, and Azure Files shares use the generic container counters. S3 and GCS use bucket counters.
+- Scope names are held only in per-attempt in-memory sets for deduplication and are not emitted by these count metrics.
+- A scope selected for scanning can fail during traversal or schedule no transfers, so `touched` can be lower than `scanned`.
+
+Additional bounded dimensions and diagnostics:
+
+- `SourceScope` and `DestScope` identify service, container/share/bucket, object-or-prefix, local directory/object, stream, benchmark, or none without emitting paths.
+- When a recognized account/bucket identity cannot be parsed, `SourceEndpointIdentity`/`DestEndpointIdentity` contain only normalized scheme, hostname, and non-default port. User info, path, query, SAS, and fragment are removed.
+- Authentication distinguishes `SAS` from `PublicAnonymous`; local, pipe, benchmark, and none endpoints use `NotApplicable`.
+- `InvocationID` is a random 128-bit identifier for one command/job attempt. Paired start/finish events share it while `RunID` remains the resumable job key.
+- `PerformanceConstraint`, `PrimaryPerformanceAdviceCode`, and up to eight deduplicated `PerformanceAdviceCodes` are emitted; human-readable advice text is not.
+- Main benchmark jobs use the same paired lifecycle with `Command=bench`. `BenchmarkMode`, `BenchmarkFileCount`, `BenchmarkFileSizeBytes`, `BenchmarkFolderCount`, `BenchmarkCleanupRequested`, and `BenchmarkIsCleanup` carry effective inputs on both events.
+- Benchmark results reuse `JobStatus`, `TerminalReason`, job-error fields, and generic finish diagnostics. No benchmark description or human-readable advice title/reason is emitted.
+- Automatic benchmark cleanup stays outside the benchmark event lifecycle. `BenchmarkIsCleanup=false` on main events makes the exclusion explicit; cleanup transfers emit no benchmark result.
+- `FailureErrorOtherCount` reports failed-transfer occurrences omitted when the error histogram is capped to ten distinct codes.
+- `HostNICSpeedAvailable` and `HostNICSpeedBucket` make unknown link speed explicit and support low-cardinality aggregation.
+- `enumeration_phase_duration_seconds` measures progress-tracker start through final job-part dispatch. It overlaps transfer and must not be summed with transfer-phase duration.
+
+Network metric semantics:
+
+- `HostNICSpeedMbps` is the highest advertised link speed AzCopy can discover. It is best-effort and may not be the interface used for the transfer; `-1` means unknown.
+- `NetworkRunContext` classifies where AzCopy runs (`azure-vm`, `on-prem`, or `unknown`).
+- Job duration/throughput cover the entire attempt. Transfer-phase duration begins when the first job part is ordered and ends at terminal wait; it may overlap enumeration because AzCopy pipelines scanning and transfer.
+- `average_storage_http_attempt_e2e_ms` is the mean duration of a Storage HTTP attempt observed by the SDK per-retry policy. Retries are separate attempts; this is not logical-operation latency or network RTT.
+- Raw operation, network-error, and categorized HTTP 503 counts are emitted alongside percentages so aggregate rates can be calculated correctly.
+- `server_busy_503_count` is a throttling/server-busy signal, not a comprehensive retry count. SDK retries, body-read retries, and retry bytes require additional instrumentation.
+- `DestEndpointKind` describes endpoint configuration only. Actual public/private routing and byte attribution are deferred because Private DNS, proxies, and VPNs require transport-level inspection.
+
+Sampling and correlation:
+
+- `SchemaVersion=1`, `SamplingRate=0.01`, `SamplingUnit=job_id`, and `SamplerVersion=job-id-sha256-v1` are attached to every emitted event.
+- Inclusion is a deterministic SHA-256 threshold decision over `SamplerVersion + JobID`. The original and every resumed attempt sharing a JobID are therefore included or excluded together.
+- `InvocationID` and timestamps are not part of the sampling key. Raising the threshold creates a nested cohort without reshuffling existing JobIDs.
+- `InvocationID` identifies one command/job attempt; paired start/finish events share it. `RunID` remains the resumable job key.
+- `AttemptType` is `original` for copy/sync/benchmark and `resume` for a resumed attempt. Resume reuses the original `RunID` but receives a new `InvocationID`.
+- `MeasurementScope` is `attempt` for original attempts and `job-cumulative` for resume. AzCopy job plans retain cumulative transfer totals across resumes, so resume outcome/rate queries are valid but resume byte/object measurements must not be summed as attempt deltas.
+
+Terminal lifecycle:
+
+- Every non-dry-run copy/sync/benchmark attempt that emits `job.started` defers exactly one `job.finished`, including enumeration failure, manager failure, and explicit context cancellation paths. Accepted resume attempts use the same lifecycle around the resume request and terminal wait.
+- `TerminalReason` is one of `completed`, `completed-with-errors`, `failed`, or `cancelled`.
+- `TerminalStage` is a bounded lifecycle value (`initialization`, `enumeration`, `transfer`, `completion`, or `completed`). Successful and partial-success finishes use `completed`; failures and cancellations retain the active stage.
+- The finish event is emitted before job-manager cleanup so the finalizer can read the live summary and progress counters. Cancellation classification also checks the attempt context, because a terminal wait can return a different error after cancellation.
+- Process crashes, forced termination, and machine loss cannot run the finalizer. Ingestion must classify a sampled start without a matching finish after a defined timeout as probable abandonment, not explicit cancellation.
+
+Job-level error classification:
+
+- Failed and partial-success finish events can include `JobErrorCategory` and `JobErrorCode`. Completed and cancelled events leave both empty because cancellation is represented by `TerminalReason` rather than treated as an error.
+- Categories are bounded to authentication, authorization, throttling, timeout, network, local I/O, conflict, not found, service, AzCopy internal, lifecycle-stage fallback, or unknown.
+- Typed Azure `ResponseError` values retain a service `ErrorCode` only when it is at most 64 ASCII characters and contains only letters, digits, `_`, `-`, or `.`. When no safe service code exists, the classifier emits a fixed HTTP-status or generic code.
+- Context deadlines, network errors, local path errors, and AzCopy internal errors use fixed machine-readable codes. Untyped failures fall back to the bounded terminal stage, such as `enumeration-error` or `transfer-error`.
+- Raw error messages, paths, URLs, request IDs, and response bodies are never emitted. The separate `FailureErrorCodes` histogram continues to represent per-transfer numeric HTTP outcomes.
+
 ### Timing of metrics being sent 
 
 We can send metrics in two batches: one at the start of the process with details about source, target, platform, CLI options, subcommand, etc.; and one at the end with number of objects, number of bytes transferred, number of failures, latency stats, etc. 
@@ -311,7 +476,105 @@ We can expose a command-line option to turn off telemetry, but it should be on b
 ### Competing for resources with AzCopy 
  
 Investigate how much additional memory usage is added by metrics collection and whether it can be turned on without significant impact, for example no more than 100 KB. 
- 
+
+
+### Infra & pipelines
+
+We will have one prod subscription and one corp subscription. Corp subscription will be used for e2e testing.
+
+The following resources will have to be provisioned as part of ADO pipeline associated with azcopy.
+
+- **Test backend resource group**
+  - Log Analytics workspace
+  - Workspace-based Application Insights
+  - 30-day retention
+  - Low daily cap
+  - Query alerts
+  - Workbook
+- **Production backend resource group**
+  - Separate Log Analytics workspace and Application Insights resource
+  - 365-day retention
+  - Measured daily cap
+  - Budget alerts
+  - Workbook
+  - Delete lock
+- **Monitors**
+  - Action group for ingestion, cap, schema, and no-data alerts
+- **E2E run resource group**
+  - Small StorageV2 account
+  - Source and destination containers
+  - Optional file share
+  - Run-specific test data
+- **Identities**
+  - Corp-tenant workload identities for infrastructure, E2E execution and query, and release builds
+- **Governance**
+  - Tags
+  - Resource locks
+  - Azure Policy compliance
+  - Deployment history
+  - Azure DevOps Environment approval for production
+
+### E2E pipeline
+
+1. Authorize with corp tenant
+• Register required resource providers during initial bootstrap.
+2. Validate infrastructure
+• Run Bicep build/lint.
+• Validate parameter files and naming.
+• Run ARM/Bicep  what-if .
+• Scan for accidental deletion or retention/cap reductions.
+3. Approval
+• Test deploys automatically on manual/nightly runs.
+• Prod uses an ADO Environment with owner approval and change evidence.
+4. Deploy persistent backend (use bicep template)
+• Create the environment-specific resource group.
+• Deploy workspace, App Insights, action group, alerts, workbook, RBAC, budget, and Prod lock.
+• Emit resource IDs and connection string as protected stage outputs.
+5. Backend health validation
+• Confirm provisioning state, retention, cap, public ingestion, local-auth settings, and query permissions.
+• Prod stops here; never send synthetic telemetry to Prod.
+6. Provision E2E fixtures — Test only
+• Create a run-scoped resource group and storage account/containers.
+• Assign the E2E identity  Storage Blob Data Contributor .
+• Output account/container names to later stages.
+7. Build telemetry-enabled AzCopy
+• Inject the Test connection string using  -ldflags .
+• Set telemetry sampling to 100% for this special E2E build.
+• Hard-fail if the placeholder instrumentation key remains.
+• Release builds separately retrieve and embed the Prod connection string.
+8. Run synthetic scenarios
+• Successful local-to-Blob copy.
+• Successful sync or benchmark smoke test.
+• One controlled terminal failure or cancellation.
+• Capture the AzCopy Job ID from structured output for correlation.
+9. Validate App Insights ingestion
+• Poll for up to approximately ten minutes to account for ingestion latency.
+• Query  customMetrics / AppMetrics  using the captured  RunID .
+• Assert:
+• One  azcopy.job.started  and one  azcopy.job.finished .
+• Matching  InvocationID .
+• Correct schema/sampler metadata.
+• Expected command, topology, status, bytes and object counts.
+• No SAS, paths, tokens, tenant IDs, or subscription IDs.
+• Publish the query result as pipeline evidence.
+10. Teardown
+• Use  condition: always() .
+• Delete only the run-scoped E2E resource group.
+• Support a Storage-Mover-style manual pause to retain failed fixtures temporarily.
+• Never delete the persistent Test/Prod telemetry backends.
+
+Required changes before reliable E2E
+
+- Add a test-build sampling override. The current fixed 1% rate makes a single-job E2E inherently flaky.
+- Wire the App Insights connection string into build and release templates.
+- Add a live ingestion validation script/test with Job-ID correlation.
+- Add a release gate preventing placeholder connection strings.
+
+TODOs after MVP:
+- add testing for non azure scenarios as well
+- add testing with file shares involved
+- add testing with gcp or aws as the source or destinations
+
 ## Timelines
 
 Action items:

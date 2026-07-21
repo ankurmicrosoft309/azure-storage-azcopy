@@ -97,10 +97,15 @@ jobs:
             Write-Output "Building executable"
             # Normally, `go build` has no effect when `go test` is used to run unit tests,
             # but we're using `go test` to run end-to-end tests that expect `go build` to have been run
+            if ([string]::IsNullOrWhiteSpace($env:AZCOPY_TELEMETRY_CONNECTION_STRING) -or
+                -not $env:AZCOPY_TELEMETRY_CONNECTION_STRING.StartsWith("InstrumentationKey=")) {
+              throw "AZCOPY_TELEMETRY_CONNECTION_STRING_TEST must be configured as a secret pipeline variable"
+            }
+            $telemetryLdflags = "-X github.com/Azure/azure-storage-azcopy/v10/azcopy.telemetryConnectionString=$env:AZCOPY_TELEMETRY_CONNECTION_STRING"
             if ($tags -ne "") {
-              go build -cover -tags $tags -o "$(build_name)"
+              go build -cover -ldflags $telemetryLdflags -tags $tags -o "$(build_name)"
             } else {
-              go build -cover -o "$(build_name)"
+              go build -cover -ldflags $telemetryLdflags -o "$(build_name)"
             }
             
             # Az PS login
@@ -139,6 +144,7 @@ jobs:
           GOOS: '$(GOOS)'
           GOARCH: '$(GOARCH)'
           AZCOPY_E2E_ACCOUNT_KEY: $(AZCOPY_E2E_ACCOUNT_KEY)
+          AZCOPY_TELEMETRY_CONNECTION_STRING: $(AZCOPY_TELEMETRY_CONNECTION_STRING_TEST)
           AZCOPY_E2E_ACCOUNT_NAME: $(AZCOPY_E2E_ACCOUNT_NAME)
           AZCOPY_E2E_ACCOUNT_KEY_HNS: $(AZCOPY_E2E_ACCOUNT_KEY_HNS)
           AZCOPY_E2E_ACCOUNT_NAME_HNS: $(AZCOPY_E2E_ACCOUNT_NAME_HNS)

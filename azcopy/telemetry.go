@@ -23,8 +23,12 @@ package azcopy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -35,28 +39,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"github.com/Azure/azure-storage-azcopy/v10/telemetry"
 )
 
-// defaultTelemetryConnectionString is the built-in Application Insights
-// connection string used to emit anonymous usage telemetry. Telemetry is ON by
-// default so that we collect usage from the broad customer base; customers can
-// opt out via the --disable-telemetry flag or the AZCOPY_DISABLE_TELEMETRY
-// environment variable.
-//
-// NOTE: replace the InstrumentationKey/IngestionEndpoint below with the real
-// XClient App Insights resource values before release.
-const defaultTelemetryConnectionString = "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://centralus-2.in.applicationinsights.azure.com/;LiveEndpoint=https://centralus.livediagnostics.monitor.azure.com/"
+const (
+	telemetrySchemaVersion  = "1"
+	telemetrySamplingRate   = 0.01
+	telemetrySamplingUnit   = "job_id"
+	telemetrySamplerVersion = "job-id-sha256-v1"
+)
 
-// telemetryConnectionString is the Application Insights connection string used
-// to emit anonymous usage telemetry. It defaults to the hardcoded value above
-// and may be overridden at build time, e.g.:
+// telemetryConnectionString is injected into official binaries at build time.
+// It remains empty for local builds, which fail closed with telemetry disabled.
+// It may be set at build time, e.g.:
 //
 //	-ldflags "-X github.com/Azure/azure-storage-azcopy/v10/azcopy.telemetryConnectionString=<conn>"
 //
-// or at runtime via AZCOPY_TELEMETRY_CONNECTION_STRING.
-var telemetryConnectionString = defaultTelemetryConnectionString
+// or overridden at runtime via AZCOPY_TELEMETRY_CONNECTION_STRING.
+var telemetryConnectionString string
 
 // telemetryDisabledByFlag is set from the --disable-telemetry CLI flag (wired
 // through ClientOptions.DisableTelemetry). When true, telemetry is disabled
@@ -101,10 +103,7 @@ func newTelemetryAgent() *telemetryAgent {
 	if telemetryDisabledByFlag || strings.EqualFold(os.Getenv(envDisableTelemetry), "true") {
 		return a
 	}
-	conn := os.Getenv(envTelemetryConnectionString)
-	if conn == "" {
-		conn = telemetryConnectionString
-	}
+	conn := configuredTelemetryConnectionString(os.Getenv)
 	if conn == "" {
 		return a
 	}
@@ -117,24 +116,36 @@ func newTelemetryAgent() *telemetryAgent {
 	return a
 }
 
+func configuredTelemetryConnectionString(getenv func(string) string) string {
+	conn := strings.TrimSpace(getenv(envTelemetryConnectionString))
+	if conn == "" {
+		conn = strings.TrimSpace(telemetryConnectionString)
+	}
+	if conn == "" || strings.Contains(strings.ToLower(conn), "instrumentationkey=00000000-0000-0000-0000-000000000000") {
+		return ""
+	}
+	return conn
+}
+
 // ReportCommandInvoked emits a single command.invoked telemetry event for the
-// given command. It is intended for commands that do not run a transfer job and
-// therefore do not emit job.started/job.finished (everything except copy and
-// sync). It is best-effort and a no-op when telemetry is disabled.
-func ReportCommandInvoked(command, runID string) {
-	getTelemetryAgent().reportCommand(command, runID)
+// given canonical command path. It is intended for commands that do not emit
+// paired job-attempt start/finish events. It is best-effort and a no-op when
+// telemetry is disabled.
+func ReportCommandInvoked(command, runID string, options telemetry.OptionAttributes) {
+	getTelemetryAgent().reportCommand(command, runID, newTelemetryInvocationID(), options)
 }
 
 // reportStarted emits a job.started event asynchronously (best-effort). It never
 // blocks the caller and never surfaces errors to the user.
-func (a *telemetryAgent) reportStarted(dims telemetry.JobDimensions, runID string, start time.Time) {
-	if a == nil || !a.enabled {
+func (a *telemetryAgent) reportStarted(dims telemetry.JobDimensions, runID, invocationID string, start time.Time) {
+	if a == nil || !a.enabled || !shouldSampleTelemetry(runID, telemetrySamplingRate) {
 		return
 	}
 	evt := telemetry.JobStartedEvent{
 		Resource:     a.resource,
 		Dimensions:   dims,
 		RunID:        runID,
+		InvocationID: invocationID,
 		Timestamp:    start,
 		StartedCount: 1,
 	}
@@ -145,26 +156,263 @@ func (a *telemetryAgent) reportStarted(dims telemetry.JobDimensions, runID strin
 // telemetrySendTimeout) so the event is delivered before the process exits.
 // Failures are logged to the job log only.
 func (a *telemetryAgent) reportFinished(evt telemetry.JobFinishedEvent) {
-	if a == nil || !a.enabled {
+	if a == nil || !a.enabled || !shouldSampleTelemetry(evt.RunID, telemetrySamplingRate) {
 		return
 	}
 	a.sendSafely(evt)
 }
 
+type attemptTelemetryFinalizer struct {
+	agent        *telemetryAgent
+	dimensions   telemetry.JobDimensions
+	runID        string
+	invocationID string
+	start        time.Time
+	stage        string
+	finished     bool
+
+	summaryFn            func() (common.ListJobSummaryResponse, bool)
+	enumerationElapsedFn func() time.Duration
+	transferElapsedFn    func() time.Duration
+	shapeFn              func() sourceShapeSummary
+	finalSummary         *common.ListJobSummaryResponse
+}
+
+func newAttemptTelemetryFinalizer(agent *telemetryAgent, dimensions telemetry.JobDimensions, runID, invocationID string, start time.Time) *attemptTelemetryFinalizer {
+	return &attemptTelemetryFinalizer{
+		agent:        agent,
+		dimensions:   dimensions,
+		runID:        runID,
+		invocationID: invocationID,
+		start:        start,
+		stage:        "initialization",
+	}
+}
+
+func (f *attemptTelemetryFinalizer) startEvent() {
+	if f == nil {
+		return
+	}
+	f.agent.reportStarted(f.dimensions, f.runID, f.invocationID, f.start)
+}
+
+func (f *attemptTelemetryFinalizer) setStage(stage string) {
+	if f != nil {
+		f.stage = stage
+	}
+}
+
+func (f *attemptTelemetryFinalizer) setFinalSummary(summary common.ListJobSummaryResponse) {
+	if f != nil {
+		copy := summary
+		f.finalSummary = &copy
+	}
+}
+
+func (f *attemptTelemetryFinalizer) finish(attemptErr error) {
+	if f == nil || f.finished {
+		return
+	}
+	f.finished = true
+
+	summary := common.ListJobSummaryResponse{}
+	if f.finalSummary != nil {
+		summary = *f.finalSummary
+	} else if f.summaryFn != nil {
+		if liveSummary, ok := f.summaryFn(); ok {
+			summary = liveSummary
+		}
+	}
+	terminalStatus, terminalReason := terminalAttemptStatus(summary.JobStatus, attemptErr)
+	summary.JobStatus = terminalStatus
+	terminalStage := f.stage
+	if terminalReason == "completed" || terminalReason == "completed-with-errors" {
+		terminalStage = "completed"
+	}
+
+	enumerationElapsed := durationOrZero(f.enumerationElapsedFn)
+	transferElapsed := durationOrZero(f.transferElapsedFn)
+	shape := sourceShapeSummary{}
+	if f.shapeFn != nil {
+		shape = f.shapeFn()
+	}
+	resource := telemetry.ResourceAttributes{}
+	if f.agent != nil {
+		resource = f.agent.resource
+	}
+	event := buildFinishedEvent(resource, f.dimensions, f.runID, f.invocationID, f.start, time.Now(), summary, time.Since(f.start), enumerationElapsed, transferElapsed, shape)
+	event.TerminalReason = terminalReason
+	event.TerminalStage = terminalStage
+	event.JobErrorCategory, event.JobErrorCode = jobErrorAttributes(attemptErr, terminalReason, terminalStage)
+	f.agent.reportFinished(event)
+}
+
+func durationOrZero(fn func() time.Duration) time.Duration {
+	if fn == nil {
+		return 0
+	}
+	return fn()
+}
+
+func terminalAttemptStatus(status common.JobStatus, attemptErr error) (common.JobStatus, string) {
+	if status == common.EJobStatus.Cancelled() || errors.Is(attemptErr, context.Canceled) {
+		return common.EJobStatus.Cancelled(), "cancelled"
+	}
+	if attemptErr != nil {
+		return common.EJobStatus.Failed(), "failed"
+	}
+	switch status {
+	case common.EJobStatus.CompletedWithErrors(), common.EJobStatus.CompletedWithErrorsAndSkipped():
+		return status, "completed-with-errors"
+	case common.EJobStatus.CompletedWithSkipped(), common.EJobStatus.Completed():
+		return status, "completed"
+	case common.EJobStatus.Failed():
+		return status, "failed"
+	default:
+		return common.EJobStatus.Completed(), "completed"
+	}
+}
+
+func jobErrorAttributes(attemptErr error, terminalReason, terminalStage string) (string, string) {
+	switch terminalReason {
+	case "completed", "cancelled":
+		return "", ""
+	case "completed-with-errors":
+		return "transfer", "transfer-failures"
+	}
+
+	var responseErr *azcore.ResponseError
+	if errors.As(attemptErr, &responseErr) {
+		code := sanitizeJobErrorCode(responseErr.ErrorCode)
+		if code == "" && responseErr.StatusCode > 0 {
+			code = "http-" + strconv.Itoa(responseErr.StatusCode)
+		}
+		if code == "" {
+			code = "storage-service-error"
+		}
+		return responseErrorCategory(responseErr.ErrorCode, responseErr.StatusCode), code
+	}
+
+	if errors.Is(attemptErr, context.DeadlineExceeded) {
+		return "timeout", "context-deadline-exceeded"
+	}
+	var pathErr *os.PathError
+	if errors.As(attemptErr, &pathErr) {
+		return "local-io", "local-path-error"
+	}
+	var urlErr *url.Error
+	if errors.As(attemptErr, &urlErr) {
+		if urlErr.Timeout() {
+			return "timeout", "network-timeout"
+		}
+		return "network", "network-error"
+	}
+	var networkErr net.Error
+	if errors.As(attemptErr, &networkErr) {
+		if networkErr.Timeout() {
+			return "timeout", "network-timeout"
+		}
+		return "network", "network-error"
+	}
+	var azErr common.AzError
+	if errors.As(attemptErr, &azErr) {
+		return "azcopy", "azcopy-" + strconv.FormatUint(azErr.ErrorCode(), 10)
+	}
+
+	switch terminalStage {
+	case "initialization", "enumeration", "transfer", "completion":
+		return terminalStage, terminalStage + "-error"
+	default:
+		return "unknown", "job-failed"
+	}
+}
+
+func responseErrorCategory(errorCode string, statusCode int) string {
+	switch strings.ToLower(errorCode) {
+	case "authenticationfailed", "invalidauthenticationinfo", "noauthenticationinformation":
+		return "authentication"
+	case "authorizationfailure", "authorizationpermissionmismatch":
+		return "authorization"
+	case "serverbusy":
+		return "throttling"
+	case "operationtimedout":
+		return "timeout"
+	}
+
+	switch statusCode {
+	case 401:
+		return "authentication"
+	case 403:
+		return "authorization"
+	case 404:
+		return "not-found"
+	case 408:
+		return "timeout"
+	case 409, 412:
+		return "conflict"
+	case 429, 503:
+		return "throttling"
+	}
+	if statusCode >= 500 {
+		return "service"
+	}
+	return "service"
+}
+
+func sanitizeJobErrorCode(code string) string {
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 64 {
+		return ""
+	}
+	for _, char := range code {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
+		}
+		return ""
+	}
+	return code
+}
+
 // reportCommand emits a single command.invoked event synchronously (bounded by
-// telemetrySendTimeout). Used for commands that do not emit job.started/finished
-// (everything except copy and sync). Best-effort; no-op when disabled.
-func (a *telemetryAgent) reportCommand(command, runID string) {
-	if a == nil || !a.enabled {
+// telemetrySendTimeout). Used for commands that do not emit paired job-attempt
+// start/finish events. Best-effort; no-op when disabled.
+func (a *telemetryAgent) reportCommand(command, runID, invocationID string, options telemetry.OptionAttributes) {
+	if a == nil || !a.enabled || !shouldSampleTelemetry(runID, telemetrySamplingRate) {
 		return
 	}
 	a.sendSafely(telemetry.CommandInvokedEvent{
 		Resource:     a.resource,
 		Command:      command,
+		Options:      options.Clone(),
 		RunID:        runID,
+		InvocationID: invocationID,
 		Timestamp:    time.Now(),
 		InvokedCount: 1,
 	})
+}
+
+func newTelemetryInvocationID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(buf)
+}
+
+func shouldSampleTelemetry(jobID string, rate float64) bool {
+	if jobID == "" || rate <= 0 {
+		return false
+	}
+	if rate >= 1 {
+		return true
+	}
+	sum := sha256.Sum256([]byte(telemetrySamplerVersion + ":" + jobID))
+	// Use 53 bits so conversion to float64 is exact. Raising the threshold
+	// creates a nested cohort without changing any JobID's stable hash.
+	value := binary.BigEndian.Uint64(sum[:8]) >> 11
+	const bucketCount = uint64(1) << 53
+	return float64(value)/float64(bucketCount) < rate
 }
 
 func (a *telemetryAgent) sendSafely(evt telemetry.MetricEvent) {
@@ -189,22 +437,43 @@ func buildResourceAttributes() telemetry.ResourceAttributes {
 	imds := probeIMDS()
 
 	return telemetry.ResourceAttributes{
-		ServiceName:        "azcopy",
-		ServiceVersion:     common.AzcopyVersion,
-		OSType:             runtime.GOOS,
-		OSVersion:          hw.osVersion,
-		HostArch:           runtime.GOARCH,
-		HostNumCPU:         runtime.NumCPU(),
-		HostCPUModel:       hw.cpuModel,
-		HostMemoryTotalGB:  hw.memoryGB,
-		HostNICSpeedMbps:   hw.nicMbps,
-		HostVirtualization: virtualization(imds.isAzureVM),
-		GeoRegion:          imds.region,
-		GeoTimezone:        geoTimezone(),
-		GeoCountry:         geoCountry(),
-		NetworkRunContext:  networkRunContext(imds.isAzureVM),
-		InstallationID:     installationID(),
-		InvocationContext:  detectInvocationContext(os.Getenv),
+		ServiceName:           "azcopy",
+		ServiceVersion:        common.AzcopyVersion,
+		SchemaVersion:         telemetrySchemaVersion,
+		SamplingRate:          telemetrySamplingRate,
+		SamplingUnit:          telemetrySamplingUnit,
+		SamplerVersion:        telemetrySamplerVersion,
+		OSType:                runtime.GOOS,
+		OSVersion:             hw.osVersion,
+		HostArch:              runtime.GOARCH,
+		HostNumCPU:            runtime.NumCPU(),
+		HostCPUModel:          hw.cpuModel,
+		HostMemoryTotalGB:     hw.memoryTotalGB,
+		HostNICSpeedMbps:      hw.nicMbps,
+		HostNICSpeedAvailable: hw.nicMbps >= 0,
+		HostNICSpeedBucket:    nicSpeedBucket(hw.nicMbps),
+		HostVirtualization:    virtualization(imds.isAzureVM),
+		GeoRegion:             imds.region,
+		GeoTimezone:           geoTimezone(),
+		GeoCountry:            geoCountry(),
+		NetworkRunContext:     networkRunContext(imds.isAzureVM),
+		InstallationID:        installationID(),
+		InvocationContext:     detectInvocationContext(os.Getenv),
+	}
+}
+
+func nicSpeedBucket(speedMbps int) string {
+	switch {
+	case speedMbps < 0:
+		return "unknown"
+	case speedMbps < 1000:
+		return "<1gbps"
+	case speedMbps < 10000:
+		return "1-<10gbps"
+	case speedMbps < 40000:
+		return "10-<40gbps"
+	default:
+		return ">=40gbps"
 	}
 }
 
@@ -266,6 +535,8 @@ func detectInvocationContext(getenv func(string) string) string {
 func baseJobDimensions(command string, fromTo common.FromTo, srcCredType, dstCredType common.CredentialType) telemetry.JobDimensions {
 	return telemetry.JobDimensions{
 		Command:             command,
+		AttemptType:         "original",
+		MeasurementScope:    "attempt",
 		FromTo:              fromTo.String(),
 		SourceType:          fromTo.From().String(),
 		DestType:            fromTo.To().String(),
@@ -277,6 +548,25 @@ func baseJobDimensions(command string, fromTo common.FromTo, srcCredType, dstCre
 		SourceAuthMechanism: srcCredType.String(),
 		DestAuthMechanism:   dstCredType.String(),
 	}
+}
+
+func resumeJobDimensions(jobDetails common.GetJobDetailsResponse, source, destination common.ResourceString, srcCredType, dstCredType common.CredentialType, options telemetry.OptionAttributes) telemetry.JobDimensions {
+	d := baseJobDimensions("jobs.resume", jobDetails.FromTo, srcCredType, dstCredType)
+	d.AttemptType = "resume"
+	d.MeasurementScope = "job-cumulative"
+	d.SourceMountType = sourceMountType(jobDetails.FromTo.From(), source.Value)
+	d.SourceStorageAccount = storageAccountName(source, jobDetails.FromTo.From())
+	d.SourceEndpointIdentity = sanitizedEndpointIdentity(source, jobDetails.FromTo.From())
+	d.SourceScope = scopeForLocation(source, jobDetails.FromTo.From(), true)
+	d.DestStorageAccount = storageAccountName(destination, jobDetails.FromTo.To())
+	d.DestEndpointIdentity = sanitizedEndpointIdentity(destination, jobDetails.FromTo.To())
+	d.DestScope = scopeForLocation(destination, jobDetails.FromTo.To(), false)
+	d.SourceAuthMechanism = authMechanism(srcCredType, source, jobDetails.FromTo.From())
+	d.DestAuthMechanism = authMechanism(dstCredType, destination, jobDetails.FromTo.To())
+	d.DestEndpointKind = endpointKind(destination, jobDetails.FromTo.To())
+	d.CloudType = cloudType(source, jobDetails.FromTo.From(), destination, jobDetails.FromTo.To())
+	d.Options = options.Clone()
+	return d
 }
 
 // protocolForLocation maps a transfer endpoint location to the wire/access
@@ -364,21 +654,6 @@ func transferDirection(fromTo common.FromTo) string {
 	}
 }
 
-// concurrencyValue returns the user-configured concurrency value, or 0 when it
-// is unset or set to "AUTO".
-func concurrencyValue() int {
-	v := common.GetEnvironmentVariable(common.EEnvironmentVariable.ConcurrencyValue())
-	n, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
-func bytesToMB(b int64) int {
-	return int(b / (1024 * 1024))
-}
-
 // storageAccountName returns a customer-identifying remote resource name: the
 // Azure storage account name (the first DNS label of the host) for Azure
 // resources, e.g. "myaccount" from "https://myaccount.blob.core.windows.net/c",
@@ -388,7 +663,7 @@ func bytesToMB(b int64) int {
 func storageAccountName(r common.ResourceString, loc common.Location) string {
 	if loc.IsAzure() {
 		host := hostOf(r)
-		if host == "" {
+		if host == "" || !isRecognizedAzureStorageHost(host) {
 			return ""
 		}
 		if i := strings.IndexByte(host, '.'); i > 0 {
@@ -411,6 +686,89 @@ func storageAccountName(r common.ResourceString, loc common.Location) string {
 		}
 	}
 	return ""
+}
+
+func isRecognizedAzureStorageHost(host string) bool {
+	for _, suffix := range []string{
+		".core.windows.net",
+		".storage.azure.net",
+		".core.usgovcloudapi.net",
+		".core.chinacloudapi.cn",
+		".core.cloudapi.de",
+	} {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizedEndpointIdentity(r common.ResourceString, loc common.Location) string {
+	if !loc.IsRemote() || storageAccountName(r, loc) != "" {
+		return ""
+	}
+	u, err := url.Parse(r.Value)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port != "" && !((scheme == "https" && port == "443") || (scheme == "http" && port == "80")) {
+		host = host + ":" + port
+	}
+	return scheme + "://" + host
+}
+
+func authMechanism(credType common.CredentialType, resource common.ResourceString, location common.Location) string {
+	if location.IsLocal() || location == common.ELocation.Pipe() || location == common.ELocation.Benchmark() || location == common.ELocation.None() {
+		return "NotApplicable"
+	}
+	if resource.SAS != "" {
+		return "SAS"
+	}
+	if credType == common.ECredentialType.Anonymous() {
+		return "PublicAnonymous"
+	}
+	return credType.String()
+}
+
+func scopeForLocation(resource common.ResourceString, location common.Location, source bool) string {
+	switch location {
+	case common.ELocation.Pipe():
+		return "stream"
+	case common.ELocation.Benchmark():
+		return "benchmark"
+	case common.ELocation.None():
+		return "none"
+	}
+	level, err := DetermineLocationLevel(resource.Value, location, source)
+	if err != nil {
+		return "unknown"
+	}
+	if location.IsLocal() {
+		if level == ELocationLevel.Container() {
+			return "local-directory"
+		}
+		return "local-object"
+	}
+	switch level {
+	case ELocationLevel.Service():
+		return "service"
+	case ELocationLevel.Object():
+		return "object-or-prefix"
+	case ELocationLevel.Container():
+		switch location {
+		case common.ELocation.File(), common.ELocation.FileNFS():
+			return "share"
+		case common.ELocation.S3(), common.ELocation.GCP():
+			return "bucket"
+		default:
+			return "container"
+		}
+	default:
+		return "unknown"
+	}
 }
 
 // hostOf returns the lower-cased hostname of a resource URL, or "" when it
@@ -481,122 +839,133 @@ func cloudTypeFromHost(host string) string {
 	}
 }
 
-func copyJobDimensions(o *CookedTransferOptions, srcCredType, dstCredType common.CredentialType, capMbps float64) telemetry.JobDimensions {
+func copyJobDimensions(o *CookedTransferOptions, srcCredType, dstCredType common.CredentialType) telemetry.JobDimensions {
 	d := baseJobDimensions("copy", o.fromTo, srcCredType, dstCredType)
 	d.SourceMountType = sourceMountType(o.fromTo.From(), o.source.Value)
 	d.SourceStorageAccount = storageAccountName(o.source, o.fromTo.From())
+	d.SourceEndpointIdentity = sanitizedEndpointIdentity(o.source, o.fromTo.From())
+	d.SourceScope = scopeForLocation(o.source, o.fromTo.From(), true)
 	d.DestStorageAccount = storageAccountName(o.destination, o.fromTo.To())
+	d.DestEndpointIdentity = sanitizedEndpointIdentity(o.destination, o.fromTo.To())
+	d.DestScope = scopeForLocation(o.destination, o.fromTo.To(), false)
+	d.SourceAuthMechanism = authMechanism(srcCredType, o.source, o.fromTo.From())
+	d.DestAuthMechanism = authMechanism(dstCredType, o.destination, o.fromTo.To())
 	d.DestEndpointKind = endpointKind(o.destination, o.fromTo.To())
 	d.CloudType = cloudType(o.source, o.fromTo.From(), o.destination, o.fromTo.To())
-	d.BlobType = o.blobType.String()
-	d.RequestedAccessTier = requestedAccessTier(o.blockBlobTier, o.pageBlobTier)
-	d.OptRecursive = o.recursive
-	d.OptOverwrite = o.forceWrite.String()
-	d.OptPutMD5 = o.putMd5
-	d.OptCapMbps = capMbps > 0
-	d.OptPreserveSMBPermissions = o.preservePermissions.IsTruthy()
-	d.OptBlockSizeMB = bytesToMB(o.blockSize)
-	d.OptConcurrency = concurrencyValue()
-	d.OptFlagsSet = copyFlagsSet(o)
+	d.Options = o.telemetryOptions.Clone()
+	if o.benchmarkTelemetry != nil {
+		d.Command = "bench"
+		d.BenchmarkMode = o.benchmarkTelemetry.mode
+		d.BenchmarkFileCount = o.benchmarkTelemetry.fileCount
+		d.BenchmarkFileSizeBytes = o.benchmarkTelemetry.fileSizeBytes
+		d.BenchmarkFolderCount = o.benchmarkTelemetry.folderCount
+		d.BenchmarkCleanupRequested = o.benchmarkTelemetry.cleanupRequested
+		d.BenchmarkIsCleanup = o.benchmarkTelemetry.isCleanup
+	}
 	return d
 }
 
-func copyFlagsSet(o *CookedTransferOptions) []string {
-	var f []string
-	appendIf(&f, o.recursive, "recursive")
-	appendIf(&f, o.putMd5, "put-md5")
-	appendIf(&f, o.preservePermissions.IsTruthy(), "preserve-permissions")
-	appendIf(&f, o.preserveInfo, "preserve-info")
-	appendIf(&f, o.preservePosixProperties, "preserve-posix-properties")
-	appendIf(&f, o.noGuessMimeType, "no-guess-mime-type")
-	appendIf(&f, o.autoDecompress, "decompress")
-	appendIf(&f, o.asSubdir, "as-subdir")
-	appendIf(&f, o.backupMode, "backup")
-	appendIf(&f, o.checkLength, "check-length")
-	appendIf(&f, o.blockSize > 0, "block-size-mb")
-	appendIf(&f, o.blobType != common.EBlobType.Detect(), "blob-type")
-	return f
+func shouldEmitCopyTelemetry(o *CookedTransferOptions) bool {
+	return o != nil && !o.dryrun && (o.benchmarkTelemetry == nil || !o.benchmarkTelemetry.isCleanup)
 }
 
-func syncJobDimensions(o *cookedSyncOptions, srcCredType, dstCredType common.CredentialType, capMbps float64) telemetry.JobDimensions {
+func syncJobDimensions(o *cookedSyncOptions, srcCredType, dstCredType common.CredentialType) telemetry.JobDimensions {
 	d := baseJobDimensions("sync", o.fromTo, srcCredType, dstCredType)
 	d.SourceMountType = sourceMountType(o.fromTo.From(), o.source.Value)
 	d.SourceStorageAccount = storageAccountName(o.source, o.fromTo.From())
+	d.SourceEndpointIdentity = sanitizedEndpointIdentity(o.source, o.fromTo.From())
+	d.SourceScope = scopeForLocation(o.source, o.fromTo.From(), true)
 	d.DestStorageAccount = storageAccountName(o.destination, o.fromTo.To())
+	d.DestEndpointIdentity = sanitizedEndpointIdentity(o.destination, o.fromTo.To())
+	d.DestScope = scopeForLocation(o.destination, o.fromTo.To(), false)
+	d.SourceAuthMechanism = authMechanism(srcCredType, o.source, o.fromTo.From())
+	d.DestAuthMechanism = authMechanism(dstCredType, o.destination, o.fromTo.To())
 	d.DestEndpointKind = endpointKind(o.destination, o.fromTo.To())
 	d.CloudType = cloudType(o.source, o.fromTo.From(), o.destination, o.fromTo.To())
-	d.OptRecursive = o.recursive
-	d.OptPutMD5 = o.putMd5
-	d.OptCapMbps = capMbps > 0
-	d.OptPreserveSMBPermissions = o.preservePermissions.IsTruthy()
-	d.OptBlockSizeMB = bytesToMB(o.blockSize)
-	d.OptConcurrency = concurrencyValue()
-	d.OptFlagsSet = syncFlagsSet(o)
+	d.Options = o.telemetryOptions.Clone()
 	return d
-}
-
-func syncFlagsSet(o *cookedSyncOptions) []string {
-	var f []string
-	appendIf(&f, o.recursive, "recursive")
-	appendIf(&f, o.putMd5, "put-md5")
-	appendIf(&f, o.preservePermissions.IsTruthy(), "preserve-permissions")
-	appendIf(&f, o.preserveInfo, "preserve-info")
-	appendIf(&f, o.preservePosixProperties, "preserve-posix-properties")
-	appendIf(&f, o.mirrorMode, "mirror-mode")
-	appendIf(&f, o.deleteDestination != common.EDeleteDestination.False(), "delete-destination")
-	appendIf(&f, o.compareHash != common.ESyncHashType.None(), "compare-hash")
-	appendIf(&f, o.blockSize > 0, "block-size-mb")
-	return f
-}
-
-func appendIf(dst *[]string, cond bool, name string) {
-	if cond {
-		*dst = append(*dst, name)
-	}
-}
-
-// requestedAccessTier returns the access tier the user explicitly requested via
-// --block-blob-tier / --page-blob-tier, or "None" when neither was set. Only one
-// of the two is ever non-None in practice; the block-blob tier wins if both set.
-func requestedAccessTier(blockTier common.BlockBlobTier, pageTier common.PageBlobTier) string {
-	if blockTier != common.EBlockBlobTier.None() {
-		return blockTier.String()
-	}
-	if pageTier != common.EPageBlobTier.None() {
-		return pageTier.String()
-	}
-	return common.EBlockBlobTier.None().String()
 }
 
 // ---------------------------------------------------------------------------
 // Finished event
 // ---------------------------------------------------------------------------
 
-func buildFinishedEvent(resource telemetry.ResourceAttributes, dims telemetry.JobDimensions, runID string, start, end time.Time, summary common.ListJobSummaryResponse, elapsed time.Duration) telemetry.JobFinishedEvent {
-	dur := elapsed.Seconds()
+func buildFinishedEvent(resource telemetry.ResourceAttributes, dims telemetry.JobDimensions, runID, invocationID string, start, end time.Time, summary common.ListJobSummaryResponse, elapsed, enumerationElapsed, transferElapsed time.Duration, shape sourceShapeSummary) telemetry.JobFinishedEvent {
+	jobDurationSeconds := elapsed.Seconds()
+	enumerationPhaseDurationSeconds := enumerationElapsed.Seconds()
+	transferPhaseDurationSeconds := transferElapsed.Seconds()
+	failureErrorCodes, failureErrorOtherCount := aggregateErrorCodesWithOther(summary.FailedTransfers)
+	performanceConstraint, primaryAdviceCode, adviceCodes := performanceAdviceAttributes(summary.PerfConstraint, summary.PerformanceAdvice)
 	return telemetry.JobFinishedEvent{
-		Resource:           resource,
-		Dimensions:         dims,
-		RunID:              runID,
-		StartTimestamp:     start,
-		EndTimestamp:       end,
-		FinishedCount:      1,
-		JobStatus:          summary.JobStatus.String(),
-		BytesTransferred:   int64(summary.TotalBytesTransferred),
-		BytesOverWire:      int64(summary.BytesOverWire),
-		TransfersCompleted: int64(summary.TransfersCompleted),
-		TransfersFailed:    int64(summary.TransfersFailed),
-		TransfersSkipped:   int64(summary.TransfersSkipped),
-		TransfersTotal:     int64(summary.TotalTransfers),
-		DurationSeconds:    dur,
-		ThroughputMbps:     throughputMbps(int64(summary.TotalBytesTransferred), dur),
-		AvgE2ELatencyMs:    int64(summary.AverageE2EMilliseconds),
-		AvgIOPS:            int64(summary.AverageIOPS),
-		ServerBusyPct:      float64(summary.ServerBusyPercentage),
-		NetworkErrorPct:    float64(summary.NetworkErrorPercentage),
-		PercentComplete:    float64(summary.PercentComplete),
-		FailureErrorCodes:  aggregateErrorCodes(summary.FailedTransfers),
+		Resource:                        resource,
+		Dimensions:                      dims,
+		RunID:                           runID,
+		InvocationID:                    invocationID,
+		StartTimestamp:                  start,
+		EndTimestamp:                    end,
+		FinishedCount:                   1,
+		JobStatus:                       summary.JobStatus.String(),
+		BytesEnumerated:                 int64(summary.TotalBytesEnumerated),
+		BytesExpected:                   int64(summary.TotalBytesExpected),
+		BytesTransferred:                int64(summary.TotalBytesTransferred),
+		BytesOverWire:                   int64(summary.BytesOverWire),
+		ObjectsScheduled:                countExcludingFolders(summary.TotalTransfers, summary.FolderPropertyTransfers),
+		RegularFilesScheduled:           int64(summary.FileTransfers),
+		SymlinksScheduled:               int64(summary.SymlinkTransfers),
+		HardlinksConvertedScheduled:     int64(summary.HardlinksConvertedCount),
+		FolderPropertiesScheduled:       int64(summary.FolderPropertyTransfers),
+		ObjectsCompleted:                countExcludingFolders(summary.TransfersCompleted, summary.FoldersCompleted),
+		ObjectsFailed:                   countExcludingFolders(summary.TransfersFailed, summary.FoldersFailed),
+		ObjectsSkipped:                  countExcludingFolders(summary.TransfersSkipped, summary.FoldersSkipped),
+		FolderPropertiesCompleted:       int64(summary.FoldersCompleted),
+		FolderPropertiesFailed:          int64(summary.FoldersFailed),
+		FolderPropertiesSkipped:         int64(summary.FoldersSkipped),
+		SourceObjectsScanned:            shape.ObjectsScanned,
+		SourceBytesScanned:              shape.BytesScanned,
+		SourceAverageObjectSizeBytes:    shape.AverageObjectSizeBytes,
+		SourceObjectSizeP50BytesApprox:  shape.ObjectSizeP50BytesApprox,
+		SourceObjectSizeP90BytesApprox:  shape.ObjectSizeP90BytesApprox,
+		SourceObjectSizeP95BytesApprox:  shape.ObjectSizeP95BytesApprox,
+		SourceObjectsUnder1MiB:          shape.ObjectsUnder1MiB,
+		SourceObjectsUnder1MiBRatioPct:  shape.ObjectsUnder1MiBRatioPct,
+		SourceMaxDirectoryDepth:         shape.MaxDirectoryDepth,
+		ContainersScanned:               shape.ContainersScanned,
+		ContainersTouched:               shape.ContainersTouched,
+		BucketsScanned:                  shape.BucketsScanned,
+		BucketsTouched:                  shape.BucketsTouched,
+		TransfersCompleted:              int64(summary.TransfersCompleted),
+		TransfersFailed:                 int64(summary.TransfersFailed),
+		TransfersSkipped:                int64(summary.TransfersSkipped),
+		TransfersTotal:                  int64(summary.TotalTransfers),
+		JobDurationSeconds:              jobDurationSeconds,
+		EnumerationPhaseDurationSeconds: enumerationPhaseDurationSeconds,
+		TransferPhaseDurationSeconds:    transferPhaseDurationSeconds,
+		JobThroughputMbps:               throughputMbps(int64(summary.TotalBytesTransferred), jobDurationSeconds),
+		TransferPhaseThroughputMbps:     throughputMbps(int64(summary.TotalBytesTransferred), transferPhaseDurationSeconds),
+		AverageStorageHTTPAttemptE2EMs:  int64(summary.AverageE2EMilliseconds),
+		AvgIOPS:                         int64(summary.AverageIOPS),
+		StorageHTTPAttemptCount:         summary.StorageHTTPAttemptCount,
+		NetworkErrorAttemptCount:        summary.NetworkErrorAttemptCount,
+		ServerBusy503Count:              summary.ServerBusy503Count,
+		ServerBusyThroughputCount:       summary.ServerBusyThroughputCount,
+		ServerBusyIOPSCount:             summary.ServerBusyIOPSCount,
+		ServerBusyOtherCount:            summary.ServerBusyOtherCount,
+		ServerBusyPct:                   float64(summary.ServerBusyPercentage),
+		NetworkErrorPct:                 float64(summary.NetworkErrorPercentage),
+		PercentComplete:                 float64(summary.PercentComplete),
+		FailureErrorCodes:               failureErrorCodes,
+		FailureErrorOtherCount:          failureErrorOtherCount,
+		PerformanceConstraint:           performanceConstraint,
+		PrimaryPerformanceAdviceCode:    primaryAdviceCode,
+		PerformanceAdviceCodes:          adviceCodes,
 	}
+}
+
+func countExcludingFolders(total, folders uint32) int64 {
+	if folders >= total {
+		return 0
+	}
+	return int64(total - folders)
 }
 
 // maxErrorCodeBuckets bounds how many distinct error codes are reported so a job
@@ -608,8 +977,13 @@ const maxErrorCodeBuckets = 10
 // code for stability), e.g. "403:5,500:2". Only the numeric codes are included
 // (no paths/messages), so the result contains no PII. Returns "" when empty.
 func aggregateErrorCodes(failed []common.TransferDetail) string {
+	histogram, _ := aggregateErrorCodesWithOther(failed)
+	return histogram
+}
+
+func aggregateErrorCodesWithOther(failed []common.TransferDetail) (string, int64) {
 	if len(failed) == 0 {
-		return ""
+		return "", 0
 	}
 	counts := make(map[int32]int)
 	for _, t := range failed {
@@ -629,14 +1003,61 @@ func aggregateErrorCodes(failed []common.TransferDetail) string {
 		}
 		return buckets[i].code < buckets[j].code
 	})
+	var otherCount int64
 	if len(buckets) > maxErrorCodeBuckets {
+		for _, bucket := range buckets[maxErrorCodeBuckets:] {
+			otherCount += int64(bucket.count)
+		}
 		buckets = buckets[:maxErrorCodeBuckets]
 	}
 	parts := make([]string, 0, len(buckets))
 	for _, b := range buckets {
 		parts = append(parts, strconv.Itoa(int(b.code))+":"+strconv.Itoa(b.count))
 	}
-	return strings.Join(parts, ",")
+	return strings.Join(parts, ","), otherCount
+}
+
+const maxPerformanceAdviceCodes = 8
+
+func performanceAdviceAttributes(constraint common.PerfConstraint, advice []common.PerformanceAdvice) (string, string, []string) {
+	constraintValue := ""
+	if constraint != common.EPerfConstraint.Unknown() {
+		constraintValue = constraint.String()
+	}
+
+	seen := make(map[string]struct{})
+	codes := make([]string, 0, len(advice))
+	primary := ""
+	for _, item := range advice {
+		code := sanitizeAdviceCode(item.Code)
+		if code == "" {
+			continue
+		}
+		if item.PriorityAdvice && primary == "" {
+			primary = code
+		}
+		if _, exists := seen[code]; exists || len(codes) == maxPerformanceAdviceCodes {
+			continue
+		}
+		seen[code] = struct{}{}
+		codes = append(codes, code)
+	}
+	return constraintValue, primary, codes
+}
+
+func sanitizeAdviceCode(code string) string {
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 64 {
+		return ""
+	}
+	for _, char := range code {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
+		}
+		return ""
+	}
+	return code
 }
 
 func throughputMbps(bytes int64, durationSeconds float64) float64 {

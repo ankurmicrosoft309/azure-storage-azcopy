@@ -34,20 +34,20 @@ import (
 // on the current platform. The per-field probes are implemented in the
 // platform-specific hostinfo_*.go files.
 type hostHardwareInfo struct {
-	osVersion string // e.g. "Ubuntu 22.04.4 LTS" / "Windows 10 Pro 19045"
-	cpuModel  string // e.g. "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz"
-	memoryGB  int    // total physical memory rounded to GiB, 0 when unknown
-	nicMbps   int    // best NIC link speed in Mbps, -1 when unknown
+	osVersion     string // e.g. "Ubuntu 22.04.4 LTS" / "Windows 10 Pro 19045"
+	cpuModel      string // e.g. "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz"
+	memoryTotalGB int    // total physical memory rounded to GiB, 0 when unknown
+	nicMbps       int    // best NIC link speed in Mbps, -1 when unknown
 }
 
 // probeHostHardware gathers best-effort host hardware facts. It never blocks on
 // the network and never fails: missing values are returned as sentinels.
 func probeHostHardware() hostHardwareInfo {
 	return hostHardwareInfo{
-		osVersion: osVersion(),
-		cpuModel:  cpuModel(),
-		memoryGB:  totalMemoryGB(),
-		nicMbps:   nicSpeedMbps(),
+		osVersion:     osVersion(),
+		cpuModel:      cpuModel(),
+		memoryTotalGB: totalMemoryGB(),
+		nicMbps:       nicSpeedMbps(),
 	}
 }
 

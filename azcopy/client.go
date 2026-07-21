@@ -56,7 +56,6 @@ type Client struct {
 	CurrentJobID      common.JobID                  // TODO (gapra): In future this should only be set when there is a current job running. On complete, this should be cleared. It can also behave as something we can check to see if a current job is running
 	oauthTokenManager *common.UserOAuthTokenManager // OAuth token manager for the current user, used for authentication
 	logLevel          common.LogLevel
-	capMbps           float64 // configured --cap-mbps throughput limit (0 when unset); used for telemetry
 }
 
 type ClientOptions struct {
@@ -70,7 +69,6 @@ func NewClient(opts ClientOptions) (Client, error) {
 	telemetryDisabledByFlag = opts.DisableTelemetry
 	c := Client{
 		logLevel: common.IffNil(opts.LogLevel, common.ELogLevel.Info()), // Default: Info
-		capMbps:  opts.CapMbps,
 	}
 	TrustedSuffixes = opts.TrustedSuffixes
 	common.InitializeFolders()
