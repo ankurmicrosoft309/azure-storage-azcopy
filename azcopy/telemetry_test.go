@@ -136,6 +136,9 @@ func TestTransferTopology(t *testing.T) {
 	a.Equal("local-to-azure", transferTopology(common.EFromTo.LocalBlob()))
 	a.Equal("azure-to-local", transferTopology(common.EFromTo.BlobLocal()))
 	a.Equal("intra-azure", transferTopology(common.EFromTo.BlobBlob()))
+	a.Equal("aws-to-azure", transferTopology(common.EFromTo.S3Blob()))
+	a.Equal("gcs-to-azure", transferTopology(common.EFromTo.GCPBlob()))
+	a.Equal("cross-cloud", transferTopology(common.FromToValue(common.ELocation.S3(), common.ELocation.GCP())))
 	a.Equal("azure-delete", transferTopology(common.EFromTo.BlobTrash()))
 }
 
@@ -168,6 +171,24 @@ func TestCloudType(t *testing.T) {
 		common.ResourceString{Value: "https://acct.blob.example.com/c"}, common.ELocation.Blob()))
 	// Neither endpoint Azure -> empty.
 	a.Equal("", cloudType(local, common.ELocation.Local(), local, common.ELocation.Local()))
+}
+
+func TestEndpointCloudType(t *testing.T) {
+	a := assert.New(t)
+	a.Equal("public", endpointCloudType(
+		common.ResourceString{Value: "https://acct.blob.core.windows.net/c"}, common.ELocation.Blob()))
+	a.Equal("gov", endpointCloudType(
+		common.ResourceString{Value: "https://acct.blob.core.usgovcloudapi.net/c"}, common.ELocation.Blob()))
+	a.Equal("china", endpointCloudType(
+		common.ResourceString{Value: "https://acct.blob.core.chinacloudapi.cn/c"}, common.ELocation.Blob()))
+	a.Equal("germany", endpointCloudType(
+		common.ResourceString{Value: "https://acct.blob.core.cloudapi.de/c"}, common.ELocation.Blob()))
+	a.Equal("public", endpointCloudType(
+		common.ResourceString{Value: "https://acct.blob.example.com/c"}, common.ELocation.Blob()))
+	a.Empty(endpointCloudType(
+		common.ResourceString{Value: "https://s3.amazonaws.com/bucket"}, common.ELocation.S3()))
+	a.Empty(endpointCloudType(
+		common.ResourceString{Value: "/local/path"}, common.ELocation.Local()))
 }
 
 func TestCountryFromLocale(t *testing.T) {
@@ -256,7 +277,9 @@ var errTest = errors.New("test error")
 func TestCopyJobDimensions(t *testing.T) {
 	a := assert.New(t)
 	o := &CookedTransferOptions{
-		fromTo: common.EFromTo.LocalBlob(),
+		fromTo:      common.EFromTo.LocalBlob(),
+		source:      common.ResourceString{Value: "local"},
+		destination: common.ResourceString{Value: "https://account.blob.core.windows.net/container"},
 		telemetryOptions: telemetry.OptionAttributes{
 			FlagsSet: []string{"block-size-mb", "put-md5", "recursive"},
 			Values: map[string]string{
@@ -270,12 +293,28 @@ func TestCopyJobDimensions(t *testing.T) {
 	a.Equal("copy", d.Command)
 	a.Equal("NotApplicable", d.SourceAuthMechanism)
 	a.Equal(common.ECredentialType.OAuthToken().String(), d.DestAuthMechanism)
+	a.Empty(d.SourceCloudType)
+	a.Equal("public", d.DestCloudType)
+	a.Equal("public", d.CloudType)
 	a.Equal([]string{"block-size-mb", "put-md5", "recursive"}, d.Options.FlagsSet)
 	a.Equal("8", d.Options.Values["OptBlockSizeMB"])
 	o.telemetryOptions.FlagsSet[0] = "mutated"
 	o.telemetryOptions.Values["OptBlockSizeMB"] = "mutated"
 	a.Equal([]string{"block-size-mb", "put-md5", "recursive"}, d.Options.FlagsSet)
 	a.Equal("8", d.Options.Values["OptBlockSizeMB"])
+}
+
+func TestCopyJobDimensionsS3ToAzureGovernment(t *testing.T) {
+	o := &CookedTransferOptions{
+		fromTo:      common.EFromTo.S3Blob(),
+		source:      common.ResourceString{Value: "https://s3.amazonaws.com/source-bucket"},
+		destination: common.ResourceString{Value: "https://account.blob.core.usgovcloudapi.net/container"},
+	}
+	dimensions := copyJobDimensions(o, common.ECredentialType.S3AccessKey(), common.ECredentialType.OAuthToken())
+	assert.Equal(t, "aws-to-azure", dimensions.TransferTopology)
+	assert.Empty(t, dimensions.SourceCloudType)
+	assert.Equal(t, "gov", dimensions.DestCloudType)
+	assert.Equal(t, "gov", dimensions.CloudType)
 }
 
 func TestCopyJobDimensionsBenchmark(t *testing.T) {
@@ -329,7 +368,9 @@ func TestBenchmarkTelemetrySurvivesOptionCooking(t *testing.T) {
 func TestSyncJobDimensions(t *testing.T) {
 	a := assert.New(t)
 	o := &cookedSyncOptions{
-		fromTo: common.EFromTo.LocalBlob(),
+		fromTo:      common.EFromTo.LocalBlob(),
+		source:      common.ResourceString{Value: "local"},
+		destination: common.ResourceString{Value: "https://account.blob.core.windows.net/container"},
 		telemetryOptions: telemetry.OptionAttributes{
 			FlagsSet: []string{"delete-destination", "mirror-mode", "recursive"},
 			Values: map[string]string{
@@ -341,6 +382,8 @@ func TestSyncJobDimensions(t *testing.T) {
 	}
 	d := syncJobDimensions(o, common.ECredentialType.SharedKey(), common.ECredentialType.Anonymous())
 	a.Equal("sync", d.Command)
+	a.Empty(d.SourceCloudType)
+	a.Equal("public", d.DestCloudType)
 	a.Equal([]string{"delete-destination", "mirror-mode", "recursive"}, d.Options.FlagsSet)
 	a.Equal("false", d.Options.Values["OptRecursive"])
 }
@@ -364,6 +407,8 @@ func TestResumeJobDimensions(t *testing.T) {
 	assert.Equal(t, "NotApplicable", dimensions.SourceAuthMechanism)
 	assert.Equal(t, "SAS", dimensions.DestAuthMechanism)
 	assert.Equal(t, "account", dimensions.DestStorageAccount)
+	assert.Empty(t, dimensions.SourceCloudType)
+	assert.Equal(t, "public", dimensions.DestCloudType)
 	assert.Equal(t, []string{"include"}, dimensions.Options.FlagsSet)
 	options.FlagsSet[0] = "mutated"
 	options.Values["OptExample"] = "mutated"

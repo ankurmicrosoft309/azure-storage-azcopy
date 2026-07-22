@@ -1,0 +1,21 @@
+// Visual: Pie chart or stacked bar
+// Legend: JobStatus; Value: EstimatedAttempts; Series/split: Command
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where name == 'azcopy.job.finished'
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| extend
+    Command = tostring(customDimensions.Command),
+    JobStatus = tostring(customDimensions.JobStatus),
+    SamplingRate = todouble(customDimensions.SamplingRate)
+| extend Weight = iif(SamplingRate > 0.0 and SamplingRate <= 1.0, 1.0 / SamplingRate, 1.0)
+| summarize
+    ObservedAttempts = count(),
+    EstimatedAttempts = sum(Weight)
+  by Command, JobStatus
+| project
+    Command = iif(isempty(Command), 'unknown', Command),
+    JobStatus = iif(isempty(JobStatus), 'unknown', JobStatus),
+    ObservedAttempts,
+    EstimatedAttempts = round(EstimatedAttempts, 0)
+| order by Command asc, EstimatedAttempts desc

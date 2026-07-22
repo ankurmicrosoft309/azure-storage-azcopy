@@ -162,6 +162,8 @@ The example below is generated directly from the AzCopy serialization code (an o
 
 The finished event carries the same property bag as started event plus `JobStatus`, `TerminalReason`, `TerminalStage`, and (when there were transfer failures) `FailureErrorCodes`, and adds all the numeric measurements.
 
+For the direct Application Insights backend, one event is sent in one `/v2.1/track` HTTP batch containing one envelope per measurement. Application Insights only retains the first metric when several metrics share one envelope, so finish events repeat the property bag across their measurement envelopes.
+
 ```json
 {
   "name": "Microsoft.ApplicationInsights.Metric",
@@ -310,6 +312,8 @@ The finished event carries the same property bag as started event plus `JobStatu
       "properties": {
         "BlobType": "BlockBlob",
         "CloudType": "public",
+        "SourceCloudType": "",
+        "DestCloudType": "public",
         "Command": "copy",
         "DestAuthMechanism": "OAuthToken",
         "DestEndpointKind": "public",
@@ -353,7 +357,7 @@ The finished event carries the same property bag as started event plus `JobStatu
         "SourceStorageAccount": "",
         "SourceType": "Local",
         "TransferDirection": "upload",
-        "TransferTopology": "intra-azure"
+        "TransferTopology": "local-to-azure"
       }
     }
   }
@@ -428,7 +432,7 @@ Network metric semantics:
 
 Sampling and correlation:
 
-- `SchemaVersion=1`, `SamplingRate=0.01`, `SamplingUnit=job_id`, and `SamplerVersion=job-id-sha256-v1` are attached to every emitted event.
+- `SchemaVersion=2`, `SamplingRate=0.01`, `SamplingUnit=job_id`, and `SamplerVersion=job-id-sha256-v1` are attached to every emitted event. Schema version 2 adds `SourceCloudType` and `DestCloudType`; the combined `CloudType` remains for compatibility.
 - Inclusion is a deterministic SHA-256 threshold decision over `SamplerVersion + JobID`. The original and every resumed attempt sharing a JobID are therefore included or excluded together.
 - `InvocationID` and timestamps are not part of the sampling key. Raising the threshold creates a nested cohort without reshuffling existing JobIDs.
 - `InvocationID` identifies one command/job attempt; paired start/finish events share it. `RunID` remains the resumable job key.

@@ -1,0 +1,13 @@
+// Visual: Bar chart
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name == 'azcopy.job.finished'
+| extend
+    Category = tostring(customDimensions.JobErrorCategory),
+    Code = tostring(customDimensions.JobErrorCode),
+    TerminalReason = tostring(customDimensions.TerminalReason),
+    TerminalStage = tostring(customDimensions.TerminalStage)
+| extend Error = strcat(iif(isempty(Category), 'none', Category), ' / ', iif(isempty(Code), 'none', Code))
+| summarize Attempts = count() by Error, TerminalReason, TerminalStage
+| top 30 by Attempts desc

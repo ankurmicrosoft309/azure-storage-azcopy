@@ -1,0 +1,14 @@
+// Visual: Bar chart
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name == 'azcopy.job.finished'
+| extend
+    Command = tostring(customDimensions.Command),
+    FromTo = tostring(customDimensions.FromTo),
+    Direction = tostring(customDimensions.TransferDirection),
+    Topology = tostring(customDimensions.TransferTopology),
+    SourceType = tostring(customDimensions.SourceType),
+    DestType = tostring(customDimensions.DestType)
+| summarize Attempts = count() by Command, FromTo, Direction, Topology, SourceType, DestType
+| top 30 by Attempts desc

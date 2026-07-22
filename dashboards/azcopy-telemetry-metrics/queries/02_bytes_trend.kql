@@ -1,0 +1,7 @@
+// Visual: Time chart
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name in ('azcopy.bytes_enumerated', 'azcopy.bytes_expected', 'azcopy.bytes_transferred', 'azcopy.bytes_over_wire')
+| summarize Bytes = sum(value) by bin(timestamp, 1h), Metric = name
+| order by timestamp asc

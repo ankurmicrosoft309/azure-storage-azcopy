@@ -1,0 +1,7 @@
+// Visual: Time chart
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name in ('azcopy.job_throughput_mbps', 'azcopy.transfer_phase_throughput_mbps')
+| summarize AverageMbps = avg(value) by bin(timestamp, 1h), Metric = name
+| order by timestamp asc

@@ -28,7 +28,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -202,9 +201,7 @@ type appInsightsExporter struct {
 }
 
 func (e *appInsightsExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
-	// Collect every data point first, then group points that share the same
-	// attribute set into a single envelope so the (large) property bag is sent
-	// only once per group instead of once per metric.
+	// Collect every data point before sending them in one HTTP batch.
 	var points []metricPoint
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -277,31 +274,13 @@ func metricToPoints(m metricdata.Metrics) []metricPoint {
 	return points
 }
 
-// pointsToEnvelopes groups data points by their attribute set, emitting one
-// envelope per distinct attribute set with all of that group's metrics.
+// pointsToEnvelopes emits one envelope per data point. The Track API accepts
+// multiple envelopes in one batch, but only ingests the first metric when an
+// envelope contains multiple metrics.
 func (e *appInsightsExporter) pointsToEnvelopes(points []metricPoint) []appInsightsEnvelope {
-	type group struct {
-		props   map[string]string
-		metrics []appInsightsMetric
-	}
-	var order []string
-	groups := make(map[string]*group)
-
-	for _, p := range points {
-		key := propsKey(p.props)
-		g, ok := groups[key]
-		if !ok {
-			g = &group{props: p.props}
-			groups[key] = g
-			order = append(order, key)
-		}
-		g.metrics = append(g.metrics, p.metric)
-	}
-
 	ts := time.Now().UTC().Format(time.RFC3339)
-	envelopes := make([]appInsightsEnvelope, 0, len(order))
-	for _, key := range order {
-		g := groups[key]
+	envelopes := make([]appInsightsEnvelope, 0, len(points))
+	for _, point := range points {
 		envelopes = append(envelopes, appInsightsEnvelope{
 			Name: "Microsoft.ApplicationInsights.Metric",
 			Time: ts,
@@ -309,30 +288,13 @@ func (e *appInsightsExporter) pointsToEnvelopes(points []metricPoint) []appInsig
 			Data: appInsightsData{
 				BaseType: "MetricData",
 				BaseData: appInsightsMetricData{
-					Metrics:    g.metrics,
-					Properties: g.props,
+					Metrics:    []appInsightsMetric{point.metric},
+					Properties: point.props,
 				},
 			},
 		})
 	}
 	return envelopes
-}
-
-// propsKey builds a stable string key from a property map for grouping.
-func propsKey(props map[string]string) string {
-	keys := make([]string, 0, len(props))
-	for k := range props {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(props[k])
-		b.WriteByte('\x00')
-	}
-	return b.String()
 }
 
 func attrsToProps(attrs attribute.Set) map[string]string {

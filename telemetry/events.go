@@ -148,7 +148,9 @@ type JobDimensions struct {
 	DestEndpointIdentity      string
 	DestScope                 string
 	DestEndpointKind          string // "public" | "private-endpoint"
-	CloudType                 string // "public" | "gov" | "china" | "germany"
+	SourceCloudType           string // Azure environment: "public" | "gov" | "china" | "germany"; empty for non-Azure
+	DestCloudType             string // Azure environment: "public" | "gov" | "china" | "germany"; empty for non-Azure
+	CloudType                 string // Legacy combined Azure environment; prefer SourceCloudType and DestCloudType
 	SourceAuthMechanism       string // "OAuthToken" | "Anonymous" | "SharedKey" | ...
 	DestAuthMechanism         string // "OAuthToken" | "Anonymous" | "SharedKey" | ...
 	BenchmarkMode             string // upload | download
@@ -178,6 +180,8 @@ func (jd JobDimensions) props() map[string]string {
 		"DestEndpointIdentity":   jd.DestEndpointIdentity,
 		"DestScope":              jd.DestScope,
 		"DestEndpointKind":       jd.DestEndpointKind,
+		"SourceCloudType":        jd.SourceCloudType,
+		"DestCloudType":          jd.DestCloudType,
 		"CloudType":              jd.CloudType,
 		"SourceAuthMechanism":    jd.SourceAuthMechanism,
 		"DestAuthMechanism":      jd.DestAuthMechanism,

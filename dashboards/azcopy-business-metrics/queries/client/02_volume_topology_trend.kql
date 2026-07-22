@@ -1,0 +1,30 @@
+// Visual: Stacked column chart
+// X column: timestamp; Y columns: EstimatedAttempts, EstimatedDataTB; Series: Topology
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| extend
+    InvocationID = tostring(customDimensions.InvocationID),
+    JobID = tostring(customDimensions.RunID),
+    TopologyValue = tostring(customDimensions.TransferTopology),
+    SamplingRateValue = todouble(customDimensions.SamplingRate)
+| where isnotempty(InvocationID) and name != 'azcopy.command.invoked'
+| summarize
+    EndTime = max(timestamp),
+    FinishedRows = countif(name == 'azcopy.job.finished'),
+    Topology = take_any(TopologyValue),
+    SamplingRate = max(SamplingRateValue),
+    BytesTransferred = maxif(value, name == 'azcopy.bytes_transferred')
+  by InvocationID, JobID
+| where FinishedRows > 0
+| extend Weight = iif(SamplingRate > 0.0 and SamplingRate <= 1.0, 1.0 / SamplingRate, 1.0)
+| summarize
+    EstimatedAttempts = sum(Weight),
+    EstimatedBytes = sum(Weight * BytesTransferred)
+  by Day = bin(EndTime, 1d), Topology
+| project
+    timestamp = Day,
+    Topology = iif(isempty(Topology), 'unknown', Topology),
+    EstimatedAttempts = round(EstimatedAttempts, 0),
+    EstimatedDataTB = round(EstimatedBytes / 1000000000000.0, 3)
+| order by timestamp asc, Topology asc

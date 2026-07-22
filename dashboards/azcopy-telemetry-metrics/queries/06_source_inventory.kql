@@ -1,0 +1,11 @@
+// Visual: Multi stat
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| summarize
+    SourceObjectsScanned = sumif(value, name == 'azcopy.source_objects_scanned'),
+    SourceBytesScanned = sumif(value, name == 'azcopy.source_bytes_scanned'),
+    ContainersScanned = sumif(value, name == 'azcopy.containers_scanned'),
+    ContainersTouched = sumif(value, name == 'azcopy.containers_touched'),
+    BucketsScanned = sumif(value, name == 'azcopy.buckets_scanned'),
+    BucketsTouched = sumif(value, name == 'azcopy.buckets_touched')

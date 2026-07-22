@@ -92,6 +92,9 @@ func sampleStarted() JobStartedEvent {
 			FromTo:           "LocalBlob",
 			SourceType:       "Local",
 			DestType:         "Blob",
+			SourceCloudType:  "",
+			DestCloudType:    "public",
+			CloudType:        "public",
 			Options: OptionAttributes{
 				FlagsSet: []string{"recursive", "put-md5"},
 				Values: map[string]string{
@@ -412,15 +415,21 @@ func TestMergeProps(t *testing.T) {
 	assert.Equal(t, map[string]string{"a": "1", "b": "2", "c": "3"}, out)
 }
 
-func TestEventToEnvelope(t *testing.T) {
-	e := eventToEnvelope("ikey-1", sampleFinished())
-	assert.Equal(t, "Microsoft.ApplicationInsights.Metric", e.Name)
-	assert.Equal(t, "ikey-1", e.IKey)
-	assert.Equal(t, "MetricData", e.Data.BaseType)
-	// All 14 measurements live in a single envelope, sharing one property bag.
-	require.Len(t, e.Data.BaseData.Metrics, 50)
-	assert.Equal(t, "copy", e.Data.BaseData.Properties["Command"])
-	assert.Equal(t, "azcopy.job.finished", e.Data.BaseData.Metrics[0].Name)
+func TestEventToEnvelopes(t *testing.T) {
+	envelopes := eventToEnvelopes("ikey-1", sampleFinished())
+	require.Len(t, envelopes, 50)
+	for _, envelope := range envelopes {
+		assert.Equal(t, "Microsoft.ApplicationInsights.Metric", envelope.Name)
+		assert.Equal(t, "ikey-1", envelope.IKey)
+		assert.Equal(t, "MetricData", envelope.Data.BaseType)
+		assert.Len(t, envelope.Data.BaseData.Metrics, 1)
+		assert.Equal(t, "copy", envelope.Data.BaseData.Properties["Command"])
+	}
+	assert.Equal(t, "", envelopes[0].Data.BaseData.Properties["SourceCloudType"])
+	assert.Equal(t, "public", envelopes[0].Data.BaseData.Properties["DestCloudType"])
+	assert.Equal(t, "public", envelopes[0].Data.BaseData.Properties["CloudType"])
+	assert.Equal(t, "azcopy.job.finished", envelopes[0].Data.BaseData.Metrics[0].Name)
+	assert.Equal(t, "azcopy.percent_complete", envelopes[49].Data.BaseData.Metrics[0].Name)
 }
 
 func TestReportEventAppInsights(t *testing.T) {
@@ -442,9 +451,14 @@ func TestReportEventAppInsights(t *testing.T) {
 
 	var envs []appInsightsEnvelope
 	require.NoError(t, json.Unmarshal(client.lastBody, &envs))
-	// A single envelope carries all 14 measurements (no per-metric duplication).
-	require.Len(t, envs, 1)
-	assert.Len(t, envs[0].Data.BaseData.Metrics, 50)
+	// One HTTP request batches one envelope per measurement. Application
+	// Insights only ingests the first metric when an envelope contains several.
+	require.Len(t, envs, 50)
+	for _, envelope := range envs {
+		assert.Len(t, envelope.Data.BaseData.Metrics, 1)
+	}
+	assert.Equal(t, "azcopy.job.finished", envs[0].Data.BaseData.Metrics[0].Name)
+	assert.Equal(t, "azcopy.percent_complete", envs[49].Data.BaseData.Metrics[0].Name)
 }
 
 func TestReportEventAppInsightsServerError(t *testing.T) {
@@ -486,10 +500,12 @@ func TestReportEventOTel(t *testing.T) {
 
 	var envs []appInsightsEnvelope
 	require.NoError(t, json.Unmarshal(client.lastBody, &envs))
-	// All OTel counters share one attribute set, so they collapse to a single
-	// envelope carrying every measurement.
-	require.Len(t, envs, 1)
-	assert.Len(t, envs[0].Data.BaseData.Metrics, 50)
+	require.Len(t, envs, 50)
+	for _, envelope := range envs {
+		assert.Len(t, envelope.Data.BaseData.Metrics, 1)
+	}
+	assert.Equal(t, "azcopy.job.finished", envs[0].Data.BaseData.Metrics[0].Name)
+	assert.Equal(t, "azcopy.percent_complete", envs[49].Data.BaseData.Metrics[0].Name)
 	assert.Equal(t, "copy", envs[0].Data.BaseData.Properties["Command"])
 }
 

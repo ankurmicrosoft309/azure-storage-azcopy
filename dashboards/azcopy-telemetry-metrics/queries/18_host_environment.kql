@@ -1,0 +1,22 @@
+// Visual: Table
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name == 'azcopy.job.finished'
+| extend
+    Version = tostring(customDimensions.ServiceVersion),
+    SchemaVersion = tostring(customDimensions.SchemaVersion),
+    OSType = tostring(customDimensions.OSType),
+    OSVersion = tostring(customDimensions.OSVersion),
+    Architecture = tostring(customDimensions.HostArch),
+    CPUCount = toint(customDimensions.HostNumCPU),
+    CPUModel = tostring(customDimensions.HostCPUModel),
+    MemoryGB = toint(customDimensions.HostMemoryTotalGB),
+    NICSpeedBucket = tostring(customDimensions.HostNICSpeedBucket),
+    Virtualization = tostring(customDimensions.HostVirtualization),
+    Region = tostring(customDimensions.GeoRegion),
+    Country = tostring(customDimensions.GeoCountry),
+    NetworkContext = tostring(customDimensions.NetworkRunContext),
+    InvocationContext = tostring(customDimensions.InvocationContext)
+| summarize Attempts = count() by Version, SchemaVersion, OSType, OSVersion, Architecture, CPUCount, CPUModel, MemoryGB, NICSpeedBucket, Virtualization, Region, Country, NetworkContext, InvocationContext
+| top 100 by Attempts desc

@@ -39,8 +39,6 @@ The current branch already emits basic host, endpoint, option, volume, outcome, 
 | Storage Mover nudge | No production implementation or final `aka.ms` destination exists. |
 | Early attempt coverage | `copy` and `sync` create the paired-event finalizer only after transfer executor and enumerator initialization. Failures before that point emit no job attempt. Dry runs also emit no paired events. |
 | Hard termination | A killed process cannot emit `job.finished`; abandonment needs ingestion-side timeout inference, which is not implemented here. |
-| Transfer category accuracy | `transferTopology` classifies every S2S transfer as `intra-azure`; this includes `S3Blob` and `GCPBlob`, so the requested AWS-to-Azure and GCS-to-Azure category metrics are not currently accurate. |
-| Per-endpoint cloud identity | The event has one combined `CloudType`, not independent source and destination cloud fields. Cross-cloud endpoint reporting is therefore incomplete. |
 | Container/bucket sizes | Counts are emitted, but aggregate or distributional container/bucket sizes are not. |
 | Subscription, tenant, and storage region | Subscription and tenant are intentionally absent from the client and the proposed server enrichment is outside this repository. Storage-account region is not collected. |
 | Public/private network bytes | `DestEndpointKind` only checks for `.privatelink.` in the destination hostname and bytes are not split by actual route. Private DNS using a public hostname is indistinguishable. |
@@ -225,7 +223,7 @@ The best bounded collection point for **scheduled copy work** is `CopyTransferPr
 | Execution geography | Current `GeoRegion`, `GeoCountry`, and `GeoTimezone` describe the host running AzCopy. | Available/Partial | Rename `GeoRegion` to `ExecutionRegion` and document IMDS/unknown behavior. Use reviewed country and timezone buckets. Do not label these values as storage geography. |
 | Storage region | Not emitted and not encoded in normal data-plane endpoints. | Out of current scope | Subscription enrichment does not imply storage-region collection. Add region only through a separately approved server-side enrichment if a business need is established. |
 | S3/GCS identity | Bucket names are currently placed in storage-account fields. Decision #3 permits an account name or sanitized endpoint URL, not resource paths. | Clarify/Low | Prefer sanitized provider endpoint identity. Collect a bucket name only if privacy review explicitly treats it as the approved provider equivalent of an account name; never include object prefixes. |
-| Cloud type | Partially implemented as one combined `CloudType`, inferred from the first recognized Azure source or destination suffix. It is not represented independently per endpoint. | Partial | Add separate source and destination cloud values for cross-cloud analysis. Keep each value low-cardinality. |
+| Cloud type | Implemented independently as `SourceCloudType` and `DestCloudType` for Azure endpoints, with values `public`, `gov`, `china`, or `germany`. Non-Azure endpoints are empty and remain identified by endpoint type. The combined `CloudType` is retained for schema compatibility. | Available | Prefer the role-specific fields in new queries. Retire the combined compatibility field only through a future versioned schema change. |
 | Authentication mechanism | Implemented with distinct `SAS`, `PublicAnonymous`, provider/OAuth/shared-key values, and `NotApplicable` for local/pipe/benchmark endpoints. | Available | Classification uses parsed SAS presence only; credential material is never emitted. |
 
 Evidence: `storageAccountName`, `hostOf`, `cloudType`, geography, and credential dimensions in [azcopy/telemetry.go](azcopy/telemetry.go).
@@ -276,10 +274,20 @@ Benchmark inputs are converted into a copy job in [cmd/benchmark.go](cmd/benchma
 | ICM linkage | No ICM integration exists. | External | Join in the incident/support system with restricted access. |
 | Command invocation ID | Implemented as random 128-bit `InvocationID` per command/job attempt. Copy/sync/benchmark/resume start and finish share it; `RunID` remains the resumable job key. | Available | Use `AttemptType` to distinguish original and resume attempts. |
 | Job ID | Available as `RunID` for job events and resume command invocation. | Available | Rename the field to `JobID`. Reuse it across the original and resume attempts as the correlation key. |
-| Top error category | Numeric transfer error histogram exists; no stable category taxonomy exists. | Moderate | Define versioned categories such as authentication, authorization, throttling, network, source changed, destination conflict, and local I/O. |
+| Top error category | A coarse job-level category set exists (`authentication`, `authorization`, `throttling`, `timeout`, `network`, `local-io`, `conflict`, `not-found`, `service`, `azcopy`, lifecycle stages, and `unknown`). It is not independently versioned, provider-complete, or unified with numeric transfer outcomes and performance-advice codes. | Moderate | Add `ErrorTaxonomyVersion` and a documented mapping contract. Preserve provider code separately from normalized category, stage, endpoint role, retryability, and remediation code. |
 | Remediation shown | Not captured. Some performance advice is shown. | Low for owned advice | Emit an advice/remediation code when AzCopy actually displays it. Do not emit full text. |
 | Remediation attempted | Usually not observable unless the user invokes a specific AzCopy action. | Partial/External | Record only explicit in-product actions and correlate by invocation ID. Do not infer user behavior outside AzCopy. |
 | Resolved without escalation | AzCopy cannot know whether the user later opens a case or considers the issue resolved. | External | Compute in the support system from case creation and follow-up signals. This is not a client-only metric. |
+
+#### Stable Support Error Taxonomy
+
+The current telemetry has three useful but separate error-related surfaces:
+
+1. `JobErrorCategory` and `JobErrorCode` classify the terminal attempt error. Typed Azure service errors map selected response codes/statuses into coarse categories; network, timeout, local-path, AzCopy, and lifecycle-stage fallbacks cover other observable failures.
+2. `FailureErrorCodes` is a bounded top-ten histogram of numeric per-transfer outcomes with `FailureErrorOtherCount` for the omitted tail. It does not preserve endpoint role, provider semantics, or a normalized support category per bucket.
+3. `PerformanceAdviceCodes` describes likely performance constraints. These codes are actionable signals, but they are not error categories and are maintained separately by the performance advisor.
+
+A stable support taxonomy would define a versioned contract across those surfaces. At minimum it should emit a normalized category, stable normalized code, lifecycle stage, source/destination role, provider, retryability, customer-actionability, and remediation code while retaining the raw bounded provider code separately. Mapping changes must increment `ErrorTaxonomyVersion` so dashboards can compare like with like. Unknown provider codes should remain queryable as `unknown` plus sanitized provider code rather than silently collapsing into `service` or a lifecycle-stage fallback.
 
 ## Business Use-Case Coverage
 
@@ -310,7 +318,7 @@ Conclusion: server enrichment restores the earlier subscription-level business a
 
 | Business metric | Required signals | Coverage assessment | Sampling/interpretation |
 | --- | --- | --- | --- |
-| Data transferred by on-prem-to-Azure, Azure-to-Azure, AWS-to-Azure, and GCS-to-Azure | Source/destination type, `FromTo`, topology, bytes | Partial. `FromTo` and endpoint types can derive the categories, but emitted `TransferTopology` currently labels every S2S job, including S3/GCS sources, as `intra-azure`. Terminal coverage is also incomplete before paired-event initialization. | Correct the client topology or derive the category from `FromTo` at ingestion, then estimate totals with inverse-probability weighting. Include confidence bounds for small categories. |
+| Data transferred by on-prem-to-Azure, Azure-to-Azure, AWS-to-Azure, and GCS-to-Azure | Source/destination type, `FromTo`, topology, bytes | Implemented for emitted jobs. `TransferTopology` now distinguishes `aws-to-azure`, `gcs-to-azure`, `intra-azure`, `local-to-azure`, and `azure-to-local`. Early failures before paired-event initialization remain absent. | Estimate totals with inverse-probability weighting and include confidence bounds for small categories. Track unmatched or pre-initialization failures separately. |
 | Average time to migrate per TB by category | Topology, bytes, duration, status | Covered after terminal-event fix. | Exclude zero-byte jobs; stratify by job-size buckets because tiny jobs produce unstable per-TB normalization. |
 | Throughput P50/P90/P95 | Job throughput, topology, job-size bucket | Covered for current job-level throughput. | A 1% sample can support percentiles when the resulting sample count is adequate. Always show `n`; rare categories may be unusable. |
 | Time to complete per TB | Bytes, duration, topology | Covered after terminal-event fix. | Same caveat as average migration time. Specify mean versus median/percentile. |
@@ -320,7 +328,7 @@ Conclusion: server enrichment restores the earlier subscription-level business a
 | Retry overhead | Bytes over wire, transferred bytes, retry counts, failed bytes | Partial. `BytesOverWire - BytesTransferred` is only a proxy and also includes failed-transfer traffic. | Emit explicit retry bytes/counts before labeling this retry overhead. |
 | Top movers across categories | Derived subscription/tenant ID, endpoint role, category, bytes | Covered after server enrichment and lifecycle fixes as a subscription/tenant ranking. | Keep source and destination rankings separate, weight by sampling rate, restrict access, and label uncertainty. Job sampling can miss lower-frequency large movers. |
 
-Conclusion: category volume and job-performance distributions are the strongest initial business use cases after category derivation is corrected. Enumeration/transfer-phase and server-busy analysis are available; finalization and comprehensive retry analysis still need instrumentation. Subscription/tenant mover rankings additionally require server enrichment and privacy controls that are not implemented in this repository.
+Conclusion: category volume and job-performance distributions are the strongest initial business use cases. Provider-specific category and endpoint cloud dimensions are now emitted. Enumeration/transfer-phase and server-busy analysis are available; finalization and comprehensive retry analysis still need instrumentation. Subscription/tenant mover rankings additionally require server enrichment and privacy controls that are not implemented in this repository.
 
 ### AzCopy-Wide: Adoption and Funnel
 
@@ -378,7 +386,7 @@ Conclusion: the proposed supportability signal list is itself insufficient for m
 
 ## Implementation Backlog
 
-Completed in this branch: deterministic JobID sampling and sampler metadata; per-attempt `InvocationID`; paired copy/sync/benchmark/resume terminal events for observable exits; original/resume attempt typing and measurement scope; Test/Prod build-time connection-string injection; benchmark input dimensions with cleanup exclusion; bounded job-level error category/code; explicit option values; byte/object/source-shape metrics; scope/endpoint/auth dimensions; NIC availability/bucket; enumeration/transfer timing; raw network/503 numerators; performance advice codes/constraint; and bounded transfer-error tail accounting.
+Completed in this branch: deterministic JobID sampling and sampler metadata; per-attempt `InvocationID`; paired copy/sync/benchmark/resume terminal events for observable exits; original/resume attempt typing and measurement scope; Test/Prod build-time connection-string injection; benchmark input dimensions with cleanup exclusion; bounded job-level error category/code; explicit option values; byte/object/source-shape metrics; scope/endpoint/auth dimensions; accurate AWS/GCS/Azure transfer categories; role-specific source/destination Azure cloud dimensions; NIC availability/bucket; enumeration/transfer timing; raw network/503 numerators; performance advice codes/constraint; and bounded transfer-error tail accounting.
 
 ### Release-Blocking
 
@@ -389,12 +397,11 @@ Completed in this branch: deterministic JobID sampling and sampler metadata; per
 
 ### Moderate Follow-Up
 
-1. Correct `TransferTopology` for S3-to-Azure and GCS-to-Azure jobs, and split the combined cloud dimension into source and destination values.
-2. Add initialization and finalization durations if stable independent boundaries are introduced. Enumeration and transfer phases are implemented and overlap by design.
-3. Instrument comprehensive SDK, body-read, and network retry counts/bytes.
-4. Define restart semantics separately from resume attempts.
-5. Add provider-specific typed error adapters only where lifecycle-stage fallback proves too coarse.
-6. Add per-container/bucket size distributions only after defining whether partial-prefix size or full-scope size is required.
+1. Add initialization and finalization durations if stable independent boundaries are introduced. Enumeration and transfer phases are implemented and overlap by design.
+2. Instrument comprehensive SDK, body-read, and network retry counts/bytes.
+3. Define restart semantics separately from resume attempts.
+4. Add provider-specific typed error adapters only where lifecycle-stage fallback proves too coarse.
+5. Add per-container/bucket size distributions only after defining whether partial-prefix size or full-scope size is required.
 
 ### Defer or Move Server-Side
 
@@ -409,7 +416,7 @@ Completed in this branch: deterministic JobID sampling and sampler metadata; per
 
 - Command and flag-name adoption.
 - Version, OS, host-capacity, endpoint, protocol, cloud, and authentication mix.
-- Job and byte volume by transfer category after correcting `TransferTopology` or deriving category from `FromTo` at ingestion.
+- Job and byte volume by transfer category using the corrected provider-specific `TransferTopology` values.
 - Job throughput, operation latency, IOPS, server-busy rate, and network-error rate.
 - Success, partial-success, failure, cancellation, failed-object, and top-error distributions after lifecycle fixes.
 - Benchmark outcome, input-shape, performance-advice, and diagnostic analysis. Description text is intentionally excluded.

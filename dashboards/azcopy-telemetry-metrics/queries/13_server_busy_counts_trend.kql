@@ -1,0 +1,11 @@
+// Visual: Time chart
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name in (
+    'azcopy.server_busy_503_count',
+    'azcopy.server_busy_throughput_count',
+    'azcopy.server_busy_iops_count',
+    'azcopy.server_busy_other_count')
+| summarize Responses = sum(value) by bin(timestamp, 1h), Metric = name
+| order by timestamp asc

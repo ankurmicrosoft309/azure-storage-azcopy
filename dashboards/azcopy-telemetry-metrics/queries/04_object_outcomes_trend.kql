@@ -1,0 +1,13 @@
+// Visual: Time chart
+customMetrics
+| where timestamp between (_startTime .. _endTime)
+| where tostring(customDimensions.ServiceName) == 'azcopy'
+| where name in (
+    'azcopy.objects_completed',
+    'azcopy.objects_failed',
+    'azcopy.objects_skipped',
+    'azcopy.folder_properties_completed',
+    'azcopy.folder_properties_failed',
+    'azcopy.folder_properties_skipped')
+| summarize Objects = sum(value) by bin(timestamp, 1h), Metric = name
+| order by timestamp asc

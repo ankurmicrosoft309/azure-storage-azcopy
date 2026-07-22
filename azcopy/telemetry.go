@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	telemetrySchemaVersion  = "1"
+	telemetrySchemaVersion  = "2"
 	telemetrySamplingRate   = 0.01
 	telemetrySamplingUnit   = "job_id"
 	telemetrySamplerVersion = "job-id-sha256-v1"
@@ -564,6 +564,8 @@ func resumeJobDimensions(jobDetails common.GetJobDetailsResponse, source, destin
 	d.SourceAuthMechanism = authMechanism(srcCredType, source, jobDetails.FromTo.From())
 	d.DestAuthMechanism = authMechanism(dstCredType, destination, jobDetails.FromTo.To())
 	d.DestEndpointKind = endpointKind(destination, jobDetails.FromTo.To())
+	d.SourceCloudType = endpointCloudType(source, jobDetails.FromTo.From())
+	d.DestCloudType = endpointCloudType(destination, jobDetails.FromTo.To())
 	d.CloudType = cloudType(source, jobDetails.FromTo.From(), destination, jobDetails.FromTo.To())
 	d.Options = options.Clone()
 	return d
@@ -626,8 +628,14 @@ func sourceMountType(loc common.Location, localPath string) string {
 // by the NetworkRunContext resource attribute.
 func transferTopology(fromTo common.FromTo) string {
 	switch {
-	case fromTo.IsS2S():
+	case fromTo.From() == common.ELocation.S3() && fromTo.To().IsAzure():
+		return "aws-to-azure"
+	case fromTo.From() == common.ELocation.GCP() && fromTo.To().IsAzure():
+		return "gcs-to-azure"
+	case fromTo.From().IsAzure() && fromTo.To().IsAzure():
 		return "intra-azure"
+	case fromTo.IsS2S():
+		return "cross-cloud"
 	case fromTo.IsUpload():
 		return "local-to-azure"
 	case fromTo.IsDownload():
@@ -798,25 +806,24 @@ func endpointKind(r common.ResourceString, loc common.Location) string {
 	return "public"
 }
 
-// cloudType infers the Azure cloud environment ("public" | "gov" | "china" |
-// "germany") from the source or destination host suffix. It returns "" when
-// neither endpoint is an Azure location.
+func endpointCloudType(resource common.ResourceString, location common.Location) string {
+	if !location.IsAzure() {
+		return ""
+	}
+	if cloud := cloudTypeFromHost(hostOf(resource)); cloud != "" {
+		return cloud
+	}
+	return "public"
+}
+
+// cloudType preserves the legacy combined Azure cloud dimension. New queries
+// should use SourceCloudType and DestCloudType so endpoint roles stay distinct.
 func cloudType(src common.ResourceString, srcLoc common.Location, dst common.ResourceString, dstLoc common.Location) string {
-	if srcLoc.IsAzure() {
-		if c := cloudTypeFromHost(hostOf(src)); c != "" {
-			return c
-		}
+	if cloud := endpointCloudType(src, srcLoc); cloud != "" {
+		return cloud
 	}
-	if dstLoc.IsAzure() {
-		if c := cloudTypeFromHost(hostOf(dst)); c != "" {
-			return c
-		}
-	}
-	// At least one endpoint is Azure but the suffix was unrecognized: default to
-	// public, which is by far the most common and matches unknown sovereign-less
-	// hosts.
-	if srcLoc.IsAzure() || dstLoc.IsAzure() {
-		return "public"
+	if cloud := endpointCloudType(dst, dstLoc); cloud != "" {
+		return cloud
 	}
 	return ""
 }
@@ -851,6 +858,8 @@ func copyJobDimensions(o *CookedTransferOptions, srcCredType, dstCredType common
 	d.SourceAuthMechanism = authMechanism(srcCredType, o.source, o.fromTo.From())
 	d.DestAuthMechanism = authMechanism(dstCredType, o.destination, o.fromTo.To())
 	d.DestEndpointKind = endpointKind(o.destination, o.fromTo.To())
+	d.SourceCloudType = endpointCloudType(o.source, o.fromTo.From())
+	d.DestCloudType = endpointCloudType(o.destination, o.fromTo.To())
 	d.CloudType = cloudType(o.source, o.fromTo.From(), o.destination, o.fromTo.To())
 	d.Options = o.telemetryOptions.Clone()
 	if o.benchmarkTelemetry != nil {
@@ -881,6 +890,8 @@ func syncJobDimensions(o *cookedSyncOptions, srcCredType, dstCredType common.Cre
 	d.SourceAuthMechanism = authMechanism(srcCredType, o.source, o.fromTo.From())
 	d.DestAuthMechanism = authMechanism(dstCredType, o.destination, o.fromTo.To())
 	d.DestEndpointKind = endpointKind(o.destination, o.fromTo.To())
+	d.SourceCloudType = endpointCloudType(o.source, o.fromTo.From())
+	d.DestCloudType = endpointCloudType(o.destination, o.fromTo.To())
 	d.CloudType = cloudType(o.source, o.fromTo.From(), o.destination, o.fromTo.To())
 	d.Options = o.telemetryOptions.Clone()
 	return d

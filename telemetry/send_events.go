@@ -62,39 +62,40 @@ func (r *Reporter) sendEventAppInsights(ctx context.Context, evt MetricEvent) er
 		return err
 	}
 
-	envelope := eventToEnvelope(ikey, evt)
-	if len(envelope.Data.BaseData.Metrics) == 0 {
+	envelopes := eventToEnvelopes(ikey, evt)
+	if len(envelopes) == 0 {
 		return nil
 	}
 
-	if _, err := postEnvelopes(ctx, r.httpClient(), endpoint, []appInsightsEnvelope{envelope}); err != nil {
+	if _, err := postEnvelopes(ctx, r.httpClient(), endpoint, envelopes); err != nil {
 		return err
 	}
 
-	log.Printf("telemetry: sent %s (%d measurements) to App Insights", evt.EventName(), len(envelope.Data.BaseData.Metrics))
+	log.Printf("telemetry: sent %s (%d measurements) to App Insights", evt.EventName(), len(envelopes))
 	return nil
 }
 
-// eventToEnvelope converts an event's measurements + attributes into a single
-// App Insights metric envelope. All measurements share one properties bag, so
-// the attribute set is sent only once instead of being repeated per metric.
-func eventToEnvelope(ikey string, evt MetricEvent) appInsightsEnvelope {
+// eventToEnvelopes converts an event into one App Insights envelope per
+// measurement. The Track API accepts a batch of envelopes, but only ingests the
+// first metric when multiple metrics share one envelope.
+func eventToEnvelopes(ikey string, evt MetricEvent) []appInsightsEnvelope {
 	measurements := evt.measurements()
-	metrics := make([]appInsightsMetric, 0, len(measurements))
+	envelopes := make([]appInsightsEnvelope, 0, len(measurements))
+	timestamp := evt.timestamp().UTC().Format(time.RFC3339)
+	properties := evt.attributes()
 	for _, m := range measurements {
-		metrics = append(metrics, appInsightsMetric{Name: m.Name, Value: m.Value, Count: m.Count})
-	}
-
-	return appInsightsEnvelope{
-		Name: "Microsoft.ApplicationInsights.Metric",
-		Time: evt.timestamp().UTC().Format(time.RFC3339),
-		IKey: ikey,
-		Data: appInsightsData{
-			BaseType: "MetricData",
-			BaseData: appInsightsMetricData{
-				Metrics:    metrics,
-				Properties: evt.attributes(),
+		envelopes = append(envelopes, appInsightsEnvelope{
+			Name: "Microsoft.ApplicationInsights.Metric",
+			Time: timestamp,
+			IKey: ikey,
+			Data: appInsightsData{
+				BaseType: "MetricData",
+				BaseData: appInsightsMetricData{
+					Metrics:    []appInsightsMetric{{Name: m.Name, Value: m.Value, Count: m.Count}},
+					Properties: properties,
+				},
 			},
-		},
+		})
 	}
+	return envelopes
 }
