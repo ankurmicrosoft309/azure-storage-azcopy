@@ -59,6 +59,36 @@ func TestCommandUsesJobAttemptTelemetry(t *testing.T) {
 	}
 }
 
+func TestCommandExcludedFromTelemetry(t *testing.T) {
+	for _, command := range []string{
+		"__complete",
+		"__completeNoDesc",
+		"completion",
+		"doc",
+		"env",
+		"help",
+		"load.clfs",
+	} {
+		assert.True(t, commandExcludedFromTelemetry(command), command)
+	}
+
+	for _, command := range []string{
+		"jobs.clean",
+		"jobs.list",
+		"jobs.remove",
+		"jobs.show",
+		"list",
+		"login",
+		"login.status",
+		"logout",
+		"make",
+		"remove",
+		"set-properties",
+	} {
+		assert.False(t, commandExcludedFromTelemetry(command), command)
+	}
+}
+
 func TestTelemetryOptions(t *testing.T) {
 	for _, policy := range telemetryEnvironmentPolicies {
 		t.Setenv(policy.environment.Name, "")

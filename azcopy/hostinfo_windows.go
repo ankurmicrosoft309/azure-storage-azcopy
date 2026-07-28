@@ -109,9 +109,77 @@ func totalMemoryGB() int {
 	return int((ms.ullTotalPhys + gib/2) / gib)
 }
 
-// nicSpeedMbps is not probed on Windows; link speed is not exposed through a
-// stable, dependency-free API. Returns -1.
+type windowsNICAdapter struct {
+	interfaceType    uint32
+	operStatus       uint32
+	transmitBitsPerS uint64
+	receiveBitsPerS  uint64
+}
+
+func bestWindowsNICSpeedMbps(adapters []windowsNICAdapter) int {
+	best := -1
+	for _, adapter := range adapters {
+		if adapter.operStatus != windows.IfOperStatusUp ||
+			adapter.interfaceType == windows.IF_TYPE_SOFTWARE_LOOPBACK ||
+			adapter.interfaceType == windows.IF_TYPE_TUNNEL {
+			continue
+		}
+
+		bitsPerSecond := adapter.transmitBitsPerS
+		if adapter.receiveBitsPerS > bitsPerSecond {
+			bitsPerSecond = adapter.receiveBitsPerS
+		}
+		if bitsPerSecond == 0 {
+			continue
+		}
+
+		mbps := int(bitsPerSecond / 1_000_000)
+		if mbps > best {
+			best = mbps
+		}
+	}
+	return best
+}
+
+// nicSpeedMbps returns the highest advertised transmit or receive link speed
+// among operational non-loopback, non-tunnel adapters. Returns -1 when Windows
+// does not report a usable speed.
 func nicSpeedMbps() int {
+	const flags = windows.GAA_FLAG_SKIP_UNICAST |
+		windows.GAA_FLAG_SKIP_ANYCAST |
+		windows.GAA_FLAG_SKIP_MULTICAST |
+		windows.GAA_FLAG_SKIP_DNS_SERVER |
+		windows.GAA_FLAG_SKIP_FRIENDLY_NAME
+
+	var bufferSize uint32
+	err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, nil, &bufferSize)
+	if err != windows.ERROR_BUFFER_OVERFLOW || bufferSize == 0 {
+		return -1
+	}
+
+	for attempts := 0; attempts < 2; attempts++ {
+		buffer := make([]byte, bufferSize)
+		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
+		err = windows.GetAdaptersAddresses(windows.AF_UNSPEC, flags, 0, first, &bufferSize)
+		if err == windows.ERROR_BUFFER_OVERFLOW {
+			continue
+		}
+		if err != nil {
+			return -1
+		}
+
+		adapters := make([]windowsNICAdapter, 0, 8)
+		for adapter := first; adapter != nil; adapter = adapter.Next {
+			adapters = append(adapters, windowsNICAdapter{
+				interfaceType:    adapter.IfType,
+				operStatus:       adapter.OperStatus,
+				transmitBitsPerS: adapter.TransmitLinkSpeed,
+				receiveBitsPerS:  adapter.ReceiveLinkSpeed,
+			})
+		}
+		return bestWindowsNICSpeedMbps(adapters)
+	}
+
 	return -1
 }
 

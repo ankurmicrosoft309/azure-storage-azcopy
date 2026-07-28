@@ -1,11 +1,26 @@
 // Visual: Table
 // Percentiles are calculated over sampled jobs; show SampleSize with every row.
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | extend
     InvocationID = tostring(customDimensions.InvocationID),
-    TopologyValue = tostring(customDimensions.TransferTopology)
+  SourceTypeValue = tostring(customDimensions.SourceType),
+  DestTypeValue = tostring(customDimensions.DestType),
+  LegacyTopologyValue = tostring(customDimensions.TransferTopology)
+| extend TopologyValue = iif(isnotempty(LegacyTopologyValue), LegacyTopologyValue, case(
+  SourceTypeValue == 'S3' and DestTypeValue in ('Blob', 'BlobFS', 'File', 'FileNFS'), 'aws-to-azure',
+  SourceTypeValue == 'GCP' and DestTypeValue in ('Blob', 'BlobFS', 'File', 'FileNFS'), 'gcs-to-azure',
+  SourceTypeValue in ('Blob', 'BlobFS', 'File', 'FileNFS') and DestTypeValue in ('Blob', 'BlobFS', 'File', 'FileNFS'), 'intra-azure',
+  DestTypeValue == 'Trash', 'azure-delete',
+  SourceTypeValue in ('Local', 'Benchmark', 'Pipe') and DestTypeValue in ('Blob', 'BlobFS', 'File', 'FileNFS'), 'local-to-azure',
+  SourceTypeValue in ('Blob', 'BlobFS', 'File', 'FileNFS') and DestTypeValue in ('Local', 'Pipe'), 'azure-to-local',
+  SourceTypeValue !in ('', 'Local', 'Benchmark', 'Pipe', 'None') and DestTypeValue !in ('', 'Local', 'Pipe', 'Trash', 'None'), 'cross-cloud',
+  'unknown'))
 | where isnotempty(InvocationID) and name != 'azcopy.command.invoked'
 | summarize
     FinishedRows = countif(name == 'azcopy.job.finished'),

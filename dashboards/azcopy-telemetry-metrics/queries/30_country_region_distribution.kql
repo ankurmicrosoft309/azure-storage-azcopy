@@ -1,4 +1,4 @@
-// Visual: Time chart
+// Visual: Column chart
 customEvents
 | where name startswith 'azcopy.'
 | mv-expand MetricName = bag_keys(customMeasurements)
@@ -6,6 +6,9 @@ customEvents
 | extend value = todouble(customMeasurements[name])
 | project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where name in ('azcopy.job_throughput_mbps', 'azcopy.transfer_phase_throughput_mbps')
-| summarize AverageMbps = avg(value) by bin(timestamp, 1h), Metric = name
-| order by timestamp asc
+| where name == 'azcopy.job.finished'
+| extend Value = tostring(client_CountryOrRegion)
+| extend Value = iif(isempty(Value), 'unknown', Value)
+| summarize Attempts = count() by Value
+| top 20 by Attempts desc
+| order by Attempts desc

@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------------------
@@ -39,54 +40,40 @@ import (
 // ---------------------------------------------------------------------------
 
 type ResourceAttributes struct {
-	ServiceName           string // "azcopy"
-	ServiceVersion        string // "10.32.2"
-	SchemaVersion         string
-	SamplingRate          float64
-	SamplingUnit          string
-	SamplerVersion        string
-	OSType                string // runtime.GOOS
-	OSVersion             string // uname / RtlGetVersion
-	HostArch              string // runtime.GOARCH
-	HostNumCPU            int    // runtime.NumCPU()
-	HostCPUModel          string // /proc/cpuinfo, WMI, sysctl
-	HostMemoryTotalGB     int    // total physical memory
-	HostNICSpeedMbps      int    // best-effort; -1 when unavailable
-	HostNICSpeedAvailable bool
-	HostNICSpeedBucket    string // unknown | <1gbps | 1-<10gbps | 10-<40gbps | >=40gbps
-	HostVirtualization    string // "azure-vm" | "unknown"
-	GeoRegion             string // IMDS compute.location, else timezone bucket
-	GeoTimezone           string // IANA timezone
-	GeoCountry            string // ISO 3166 country name, e.g. "United States"
-	NetworkRunContext     string // "azure-vm" | "on-prem" | "unknown"
-	InstallationID        string // anonymous, stable per-install identifier (no PII)
-	InvocationContext     string // "interactive" | "ci" | "sdk" | "unknown"
+	AzCopyVersion      string // "10.32.2"
+	SchemaVersion      string
+	SamplingRate       float64
+	SamplerVersion     string
+	OSType             string // runtime.GOOS
+	OSVersion          string // uname / RtlGetVersion
+	HostArch           string // runtime.GOARCH
+	HostNumCPU         int    // runtime.NumCPU()
+	HostCPUModel       string // /proc/cpuinfo, WMI, sysctl
+	HostMemoryTotalGB  int    // total physical memory
+	HostNICSpeedMbps   int    // best-effort; -1 when unavailable
+	HostNICSpeedBucket string // unknown | <1gbps | 1-<10gbps | 10-<40gbps | >=40gbps
+	AzureVMDetected    bool   // true when Azure Instance Metadata Service responds
+	InstallationID     string // anonymous, stable per-install identifier (no PII)
+	InvocationContext  string // "interactive" | "ci" | "sdk" | "unknown"
 }
 
 func (ra ResourceAttributes) props() map[string]string {
 	return map[string]string{
-		"ServiceName":           ra.ServiceName,
-		"ServiceVersion":        ra.ServiceVersion,
-		"SchemaVersion":         ra.SchemaVersion,
-		"SamplingRate":          strconv.FormatFloat(ra.SamplingRate, 'f', -1, 64),
-		"SamplingUnit":          ra.SamplingUnit,
-		"SamplerVersion":        ra.SamplerVersion,
-		"OSType":                ra.OSType,
-		"OSVersion":             ra.OSVersion,
-		"HostArch":              ra.HostArch,
-		"HostNumCPU":            strconv.Itoa(ra.HostNumCPU),
-		"HostCPUModel":          ra.HostCPUModel,
-		"HostMemoryTotalGB":     strconv.Itoa(ra.HostMemoryTotalGB),
-		"HostNICSpeedMbps":      strconv.Itoa(ra.HostNICSpeedMbps),
-		"HostNICSpeedAvailable": strconv.FormatBool(ra.HostNICSpeedAvailable),
-		"HostNICSpeedBucket":    ra.HostNICSpeedBucket,
-		"HostVirtualization":    ra.HostVirtualization,
-		"GeoRegion":             ra.GeoRegion,
-		"GeoTimezone":           ra.GeoTimezone,
-		"GeoCountry":            ra.GeoCountry,
-		"NetworkRunContext":     ra.NetworkRunContext,
-		"InstallationID":        ra.InstallationID,
-		"InvocationContext":     ra.InvocationContext,
+		"AzCopyVersion":      ra.AzCopyVersion,
+		"SchemaVersion":      ra.SchemaVersion,
+		"SamplingRate":       strconv.FormatFloat(ra.SamplingRate, 'f', -1, 64),
+		"SamplerVersion":     ra.SamplerVersion,
+		"OSType":             ra.OSType,
+		"OSVersion":          ra.OSVersion,
+		"HostArch":           ra.HostArch,
+		"HostNumCPU":         strconv.Itoa(ra.HostNumCPU),
+		"HostCPUModel":       ra.HostCPUModel,
+		"HostMemoryTotalGB":  strconv.Itoa(ra.HostMemoryTotalGB),
+		"HostNICSpeedMbps":   strconv.Itoa(ra.HostNICSpeedMbps),
+		"HostNICSpeedBucket": ra.HostNICSpeedBucket,
+		"AzureVMDetected":    strconv.FormatBool(ra.AzureVMDetected),
+		"InstallationID":     ra.InstallationID,
+		"InvocationContext":  ra.InvocationContext,
 	}
 }
 
@@ -131,26 +118,20 @@ func (o OptionAttributes) addTo(props map[string]string) {
 
 type JobDimensions struct {
 	Command                   string // "copy" | "sync" | "remove"
-	AttemptType               string // original | resume
-	MeasurementScope          string // attempt | job-cumulative
+	SummaryCounterScope       string // job-cumulative for resume summaries; empty otherwise
 	FromTo                    string // "LocalBlob", "BlobLocal", "S3Blob", ...
 	SourceType                string // "Local" | "Blob" | "File" | "S3" | ...
 	DestType                  string
-	TransferDirection         string // "upload" | "download" | "s2s" | "delete"
-	TransferTopology          string // "onprem-to-azure" | "intra-azure" | ...
 	SourceProtocol            string // "smb" | "nfs" | "local" | "https" | "s3" | "gcs"
 	SourceMountType           string // "nas-smb" | "nas-nfs" | "local-disk" | "cloud-azure" | ...
-	SourceStorageAccount      string // Azure account name OR S3/GCP bucket name; HIGH cardinality (empty for local)
-	SourceEndpointIdentity    string // sanitized scheme://host[:non-default-port] fallback when account/bucket is unavailable
+	SourceStorageAccount      string // Azure storage account name; empty for non-Azure or unrecognized endpoints
 	SourceScope               string // service | container | share | bucket | object-or-prefix | local-* | stream | benchmark
 	DestProtocol              string
-	DestStorageAccount        string // Azure account name OR S3/GCP bucket name; HIGH cardinality
-	DestEndpointIdentity      string
+	DestStorageAccount        string // Azure storage account name; empty for non-Azure or unrecognized endpoints
 	DestScope                 string
 	DestEndpointKind          string // "public" | "private-endpoint"
 	SourceCloudType           string // Azure environment: "public" | "gov" | "china" | "germany"; empty for non-Azure
 	DestCloudType             string // Azure environment: "public" | "gov" | "china" | "germany"; empty for non-Azure
-	CloudType                 string // Legacy combined Azure environment; prefer SourceCloudType and DestCloudType
 	SourceAuthMechanism       string // "OAuthToken" | "Anonymous" | "SharedKey" | ...
 	DestAuthMechanism         string // "OAuthToken" | "Anonymous" | "SharedKey" | ...
 	BenchmarkMode             string // upload | download
@@ -164,33 +145,25 @@ type JobDimensions struct {
 
 func (jd JobDimensions) props() map[string]string {
 	props := map[string]string{
-		"Command":                jd.Command,
-		"FromTo":                 jd.FromTo,
-		"SourceType":             jd.SourceType,
-		"DestType":               jd.DestType,
-		"TransferDirection":      jd.TransferDirection,
-		"TransferTopology":       jd.TransferTopology,
-		"SourceProtocol":         jd.SourceProtocol,
-		"SourceMountType":        jd.SourceMountType,
-		"SourceStorageAccount":   jd.SourceStorageAccount,
-		"SourceEndpointIdentity": jd.SourceEndpointIdentity,
-		"SourceScope":            jd.SourceScope,
-		"DestProtocol":           jd.DestProtocol,
-		"DestStorageAccount":     jd.DestStorageAccount,
-		"DestEndpointIdentity":   jd.DestEndpointIdentity,
-		"DestScope":              jd.DestScope,
-		"DestEndpointKind":       jd.DestEndpointKind,
-		"SourceCloudType":        jd.SourceCloudType,
-		"DestCloudType":          jd.DestCloudType,
-		"CloudType":              jd.CloudType,
-		"SourceAuthMechanism":    jd.SourceAuthMechanism,
-		"DestAuthMechanism":      jd.DestAuthMechanism,
+		"Command":              jd.Command,
+		"FromTo":               jd.FromTo,
+		"SourceType":           jd.SourceType,
+		"DestType":             jd.DestType,
+		"SourceProtocol":       jd.SourceProtocol,
+		"SourceMountType":      jd.SourceMountType,
+		"SourceStorageAccount": jd.SourceStorageAccount,
+		"SourceScope":          jd.SourceScope,
+		"DestProtocol":         jd.DestProtocol,
+		"DestStorageAccount":   jd.DestStorageAccount,
+		"DestScope":            jd.DestScope,
+		"DestEndpointKind":     jd.DestEndpointKind,
+		"SourceCloudType":      jd.SourceCloudType,
+		"DestCloudType":        jd.DestCloudType,
+		"SourceAuthMechanism":  jd.SourceAuthMechanism,
+		"DestAuthMechanism":    jd.DestAuthMechanism,
 	}
-	if jd.AttemptType != "" {
-		props["AttemptType"] = jd.AttemptType
-	}
-	if jd.MeasurementScope != "" {
-		props["MeasurementScope"] = jd.MeasurementScope
+	if jd.SummaryCounterScope != "" {
+		props["SummaryCounterScope"] = jd.SummaryCounterScope
 	}
 	if jd.Command == "bench" {
 		props["BenchmarkMode"] = jd.BenchmarkMode
@@ -211,10 +184,9 @@ func (jd JobDimensions) props() map[string]string {
 type JobStartedEvent struct {
 	Resource   ResourceAttributes
 	Dimensions JobDimensions
-	// RunID correlates this job.started event with its matching job.finished
-	// event. Both events for a single run carry the same value (typically the
-	// AzCopy JobID). Emitted as the "RunID" property.
-	RunID        string
+	// JobID correlates the original attempt and all resume attempts. A paired
+	// job.started and job.finished event also share an InvocationID.
+	JobID        string
 	InvocationID string
 	Timestamp    time.Time
 	StartedCount int64 // monotonic counter increment, always 1
@@ -225,19 +197,15 @@ type JobStartedEvent struct {
 // ---------------------------------------------------------------------------
 
 type JobFinishedEvent struct {
-	Resource   ResourceAttributes
-	Dimensions JobDimensions
-	// RunID correlates this job.finished event with its matching job.started
-	// event. Both events for a single run carry the same value (typically the
-	// AzCopy JobID). Emitted as the "RunID" property.
-	RunID          string
+	Resource       ResourceAttributes
+	Dimensions     JobDimensions
+	JobID          string
 	InvocationID   string
 	StartTimestamp time.Time
 	EndTimestamp   time.Time
 
 	FinishedCount    int64  // monotonic counter increment, always 1
 	JobStatus        string // "Completed" | "CompletedWithErrors" | "Failed" | "Cancelled" | ...
-	TerminalReason   string // completed | completed-with-errors | cancelled | failed
 	TerminalStage    string // initialization | enumeration | transfer | completion | completed
 	JobErrorCategory string // authentication | authorization | throttling | timeout | network | local-io | conflict | not-found | service | azcopy | initialization | enumeration | transfer | completion | unknown
 	JobErrorCode     string // bounded stable code; never raw error text
@@ -245,14 +213,13 @@ type JobFinishedEvent struct {
 	// FailureErrorCodes is a compact, bounded histogram of the error codes seen
 	// across failed transfers, e.g. "403:5,500:2" (ordered by descending count).
 	// Empty when there were no failures. Contains no PII (only numeric codes).
-	FailureErrorCodes            string
-	FailureErrorOtherCount       int64
-	PerformanceConstraint        string
-	PrimaryPerformanceAdviceCode string
-	PerformanceAdviceCodes       []string
+	FailureErrorCodes      string
+	FailureErrorOtherCount int64
+	PerformanceConstraint  string
+	PerformanceAdviceCodes []string
 
 	// Measurements (from ListJobSummaryResponse + ElapsedTime)
-	BytesEnumerated                 int64 // Scheduled source payload bytes after filters
+	BytesEnumerated                 int64 // Source sizes in scheduled job-plan entries after filters and copy/sync comparison; not all bytes scanned
 	BytesExpected                   int64 // Current successful + still-expected payload bytes
 	BytesTransferred                int64 // Logical successful payload bytes; no retry duplication
 	BytesOverWire                   int64 // Physical payload traffic; includes retries and failed-transfer traffic
@@ -330,21 +297,20 @@ func (e JobFinishedEvent) timestamp() time.Time { return e.EndTimestamp }
 
 func (e JobStartedEvent) attributes() map[string]string {
 	attrs := mergeProps(e.Resource.props(), e.Dimensions.props())
-	attrs["RunID"] = e.RunID
+	attrs["JobID"] = e.JobID
 	if e.InvocationID != "" {
 		attrs["InvocationID"] = e.InvocationID
 	}
-	return attrs
+	return boundProperties(attrs)
 }
 
 func (e JobFinishedEvent) attributes() map[string]string {
 	attrs := mergeProps(e.Resource.props(), e.Dimensions.props())
-	attrs["RunID"] = e.RunID
+	attrs["JobID"] = e.JobID
 	if e.InvocationID != "" {
 		attrs["InvocationID"] = e.InvocationID
 	}
 	attrs["JobStatus"] = e.JobStatus
-	attrs["TerminalReason"] = e.TerminalReason
 	attrs["TerminalStage"] = e.TerminalStage
 	if e.JobErrorCategory != "" {
 		attrs["JobErrorCategory"] = e.JobErrorCategory
@@ -358,13 +324,10 @@ func (e JobFinishedEvent) attributes() map[string]string {
 	if e.PerformanceConstraint != "" {
 		attrs["PerformanceConstraint"] = e.PerformanceConstraint
 	}
-	if e.PrimaryPerformanceAdviceCode != "" {
-		attrs["PrimaryPerformanceAdviceCode"] = e.PrimaryPerformanceAdviceCode
-	}
 	if len(e.PerformanceAdviceCodes) > 0 {
 		attrs["PerformanceAdviceCodes"] = truncateValue(strings.Join(e.PerformanceAdviceCodes, ","))
 	}
-	return attrs
+	return boundProperties(attrs)
 }
 
 func (e JobStartedEvent) measurements() []namedMetric {
@@ -441,8 +404,8 @@ type CommandInvokedEvent struct {
 	Resource ResourceAttributes
 	Command  string // "login" | "jobs.list" | "remove" | ...
 	Options  OptionAttributes
-	// RunID is the AzCopy JobID for this invocation when one exists, else empty.
-	RunID        string
+	// JobID is present when the invocation has an AzCopy JobID.
+	JobID        string
 	InvocationID string
 	Timestamp    time.Time
 	InvokedCount int64 // monotonic counter increment, always 1
@@ -456,13 +419,13 @@ func (e CommandInvokedEvent) attributes() map[string]string {
 	attrs := e.Resource.props()
 	attrs["Command"] = e.Command
 	e.Options.addTo(attrs)
-	if e.RunID != "" {
-		attrs["RunID"] = e.RunID
+	if e.JobID != "" {
+		attrs["JobID"] = e.JobID
 	}
 	if e.InvocationID != "" {
 		attrs["InvocationID"] = e.InvocationID
 	}
-	return attrs
+	return boundProperties(attrs)
 }
 
 func (e CommandInvokedEvent) measurements() []namedMetric {
@@ -471,19 +434,110 @@ func (e CommandInvokedEvent) measurements() []namedMetric {
 	}
 }
 
-// maxPropValueLen bounds the length of a property value (e.g. OptFlagsSet) so a
-// run with many CLI flags cannot bloat the telemetry payload. Values longer
-// than this are truncated with a trailing marker.
-const maxPropValueLen = 1024
+const (
+	maxPropValueLen         = 1024
+	maxIdentifierValueLen   = 128
+	maxHostValueLen         = 256
+	maxOptionValueLen       = 512
+	maxCompactListValueLen  = 512
+	truncatedPropertyMarker = "...(truncated)"
+)
+
+var propertyValueLimits = map[string]int{
+	"AzCopyVersion":             64,
+	"SchemaVersion":             32,
+	"SamplingRate":              32,
+	"SamplerVersion":            64,
+	"OSType":                    32,
+	"OSVersion":                 maxHostValueLen,
+	"HostArch":                  32,
+	"HostNumCPU":                32,
+	"HostCPUModel":              maxHostValueLen,
+	"HostMemoryTotalGB":         32,
+	"HostNICSpeedMbps":          32,
+	"HostNICSpeedBucket":        32,
+	"AzureVMDetected":           5,
+	"InstallationID":            maxIdentifierValueLen,
+	"InvocationContext":         32,
+	"Command":                   64,
+	"SummaryCounterScope":       32,
+	"FromTo":                    64,
+	"SourceType":                64,
+	"DestType":                  64,
+	"SourceProtocol":            32,
+	"SourceMountType":           64,
+	"SourceStorageAccount":      maxHostValueLen,
+	"SourceScope":               64,
+	"DestProtocol":              32,
+	"DestStorageAccount":        maxHostValueLen,
+	"DestScope":                 64,
+	"DestEndpointKind":          64,
+	"SourceCloudType":           32,
+	"DestCloudType":             32,
+	"SourceAuthMechanism":       64,
+	"DestAuthMechanism":         64,
+	"BenchmarkMode":             32,
+	"BenchmarkFileCount":        32,
+	"BenchmarkFileSizeBytes":    32,
+	"BenchmarkFolderCount":      32,
+	"BenchmarkCleanupRequested": 5,
+	"BenchmarkIsCleanup":        5,
+	"JobID":                     maxIdentifierValueLen,
+	"InvocationID":              maxIdentifierValueLen,
+	"JobStatus":                 maxIdentifierValueLen,
+	"TerminalStage":             maxIdentifierValueLen,
+	"JobErrorCategory":          maxIdentifierValueLen,
+	"JobErrorCode":              maxIdentifierValueLen,
+	"FailureErrorCodes":         maxCompactListValueLen,
+	"PerformanceConstraint":     maxIdentifierValueLen,
+	"PerformanceAdviceCodes":    maxCompactListValueLen,
+	"OptFlagsSet":               maxPropValueLen,
+	"OptEnvVarsSet":             maxOptionValueLen,
+	"OptExcludeBlobTypes":       maxPropValueLen,
+}
 
 // truncateValue caps a property value at maxPropValueLen, appending a marker
 // when truncation occurs.
 func truncateValue(v string) string {
-	const marker = "...(truncated)"
-	if len(v) <= maxPropValueLen {
-		return v
+	return truncateValueTo(v, maxPropValueLen)
+}
+
+func truncateValueTo(value string, maxBytes int) string {
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	if maxBytes <= 0 {
+		return ""
 	}
-	return v[:maxPropValueLen-len(marker)] + marker
+	if len(value) <= maxBytes {
+		return value
+	}
+
+	marker := truncatedPropertyMarker
+	end := maxBytes - len(marker)
+	if end <= 0 {
+		marker = ""
+		end = maxBytes
+	}
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + marker
+}
+
+func propertyValueLimit(name string) int {
+	if limit, ok := propertyValueLimits[name]; ok {
+		return limit
+	}
+	if strings.HasPrefix(name, "Opt") {
+		return maxOptionValueLen
+	}
+	return maxPropValueLen
+}
+
+func boundProperties(properties map[string]string) map[string]string {
+	for name, value := range properties {
+		properties[name] = truncateValueTo(value, propertyValueLimit(name))
+	}
+	return properties
 }
 
 // mergeProps merges the given property maps into a single map. Later maps win

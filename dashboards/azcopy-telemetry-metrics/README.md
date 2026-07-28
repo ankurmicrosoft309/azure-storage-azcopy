@@ -10,7 +10,7 @@ This dashboard displays the complete numeric telemetry inventory emitted by `tel
 4. Select `azcopy-telemetry-metrics.dashboard.json` from this directory.
 5. Name the dashboard `AzCopy Telemetry Metrics` and select **Create**.
 
-The import contains 19 tiles across six pages. It uses an XStore dashboard data source to execute explicit cross-cluster queries against Application Insights. If the source needs reconnecting, use:
+The import contains 36 tiles across six pages. It uses an XStore dashboard data source to execute explicit cross-cluster queries against Application Insights. If the source needs reconnecting, use:
 
 ```text
 Cluster: https://azcore.centralus.kusto.windows.net
@@ -22,11 +22,11 @@ Database: Xstore
 | Page | Panels |
 | --- | --- |
 | Overview | Lifecycle counters, complete metric catalog, transfer dimension mix |
-| Data Volume | Bytes, scheduled object composition, object/folder outcomes, transfer outcomes |
-| Source Profile | Scanned/touched inventory, object-size statistics, small-object and directory-depth statistics |
-| Performance | Phase durations, throughput, Storage HTTP latency and IOPS |
-| Reliability | HTTP/network/error counts, server-busy counts, error/completion percentages, job errors |
-| Environment | Host/runtime distribution and recent finished-attempt dimensions |
+| Data Volume | Bytes, byte definitions, scheduled object composition, object/folder outcomes, visible outcome relationships, transfer outcomes |
+| Source Profile | Scanned/touched inventory, scanned source object-size statistics, scanned source small-object share and directory depth |
+| Performance | Phase durations, throughput, Storage HTTP latency and IOPS, performance constraints, and advice-code distributions |
+| Reliability | Visible panel guide, HTTP/network/error counts, server-busy counts, error/completion percentages, job errors |
+| Environment | Individual version, OS, architecture, CPU, memory, NIC, Azure VM detection, geography, and invocation distributions; combined detail table; recent finished attempts |
 
 The complete metric catalog provides sample count, nonzero count, minimum, average, p50, p95, and maximum for every metric observed in the selected time range. Metrics not emitted during that range do not have rows, while the grouped panels remain valid and return empty results.
 
@@ -46,4 +46,4 @@ Execute every source query against the live Application Insights component:
 ./dashboards/azcopy-telemetry-metrics/validate-queries.ps1
 ```
 
-The default dashboard time range is 24 hours. The source data is the `customMetrics` table in `sharankur_insights1`.
+The default dashboard time range is 24 hours. The source data is the `customEvents` table in `sharankur_insights1`; each query expands the packed `customMeasurements` bag into a virtual metric name/value shape.

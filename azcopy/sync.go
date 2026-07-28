@@ -250,6 +250,7 @@ func (c *Client) Sync(ctx context.Context, src, dest string, opts SyncOptions) (
 		ElapsedTime:              s.spt.GetElapsedTime(),
 	}
 	telemetryFinalizer.setFinalSummary(finalSummary)
+	telemetryFinalizer.finish(nil)
 
 	if common.AzcopyCurrentJobLogger != nil {
 		common.AzcopyCurrentJobLogger.Log(common.LogInfo, GetSyncResult(result, true))

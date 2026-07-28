@@ -19,7 +19,7 @@ Add client side telemetry/metrics collection to the AzCopy command line tool whi
  - Number of objects transferred 
  - Latency of transfer 
  - Platform, such as Linux or Windows 
- - Geo region of the system where the command is run 
+ - Country or region derived by Application Insights from the telemetry sender IP during ingestion
  - System configuration, such as CPU, memory, network, NIC speed, and whether data was transferred over public or private network 
  - Subcommand and CLI options usage 
    - Secret variables as part of CLI options should not be logged 
@@ -52,6 +52,20 @@ The focus is on setting up a pipeline which is reliable and scalable and can hel
 ## Technical Design 
 
 ![AzCopy telemetry architecture: the AzCopy CLI binary on a customer-managed VM sends HTTP POST telemetry to an Application Insights endpoint in a Microsoft subscription (feeding dashboards), while the data path uses Entra ID auth to the Azure Storage endpoint in the customer subscription.](images/telemetry-design-20260630-135449.png)
+
+### End-to-end telemetry analytics flow
+
+![End-to-end AzCopy telemetry analytics flow: AzCopy emits sampled packed lifecycle events to workspace-based Application Insights and its Log Analytics customEvents table; ADX cross-service queries validate and separate suspicious data before persisting curated tables, which feed ADX and Azure Managed Grafana dashboards.](images/telemetry-analytics-flow.png)
+
+Application Insights does not automatically copy data into the curated Kusto tables. The `customEvents` data remains in the Application Insights backing Log Analytics workspace until a scheduled query or orchestration process reads it through the ADX cross-service connection, applies validation rules, and writes accepted records or aggregates into owned ADX tables. The curated tables are the durable query surface for Grafana; rejected records and validation counters should be retained separately so filtering behavior can be audited.
+
+The validation stage can use the following signals without treating any one signal as definitive proof:
+
+- Supported schema and sampler versions, expected metric names, and required dimensions.
+- Matching `job.started` and `job.finished` events for the same `JobID` and `InvocationID`.
+- Valid relationships between bytes, transfer outcomes, percentages, durations, and sampling metadata.
+- Plausible event volume and timing per installation, account, version, and topology.
+- Optional correlation with Azure Storage server-side request/account telemetry at an approved aggregation level.
 
 We plan to use a global Application Insights backend for collecting the metrics, provisioned as **two instances within a single dedicated subscription** — one **Test** instance fed only by the E2E pipeline, and one **Prod** instance fed by preview and GA builds (see [Staging the Application Insights instance](#staging-the-application-insights-instance-environments)). This subscription is dedicated to telemetry and has nothing to do with the customer's subscription. 
  
@@ -154,15 +168,50 @@ Azure CLI and Azurite are two other open-source projects using publicly accessib
 
 ### Exact metrics being sent 
 
-Each event is sent to Application Insights as a single `Microsoft.ApplicationInsights.Metric` envelope. The numeric data points live under `data.baseData.metrics`, and all resource attributes + job dimensions are sent once as a shared `data.baseData.properties` bag (all property values are strings). The `job.started` and `job.finished` events for one attempt share the same `RunID` and `InvocationID` so they can be correlated.
+Each lifecycle event is sent to Application Insights as one `Microsoft.ApplicationInsights.Event` envelope. The numeric data points live under `data.baseData.measurements`, and all resource attributes + job dimensions are sent once as a shared `data.baseData.properties` bag (all property values are strings). The `job.started` and `job.finished` events for one attempt share the same `JobID` and `InvocationID` so they can be correlated. Application Insights stores these envelopes as one `customEvents` row per lifecycle event.
+
+Every property value is bounded before either exporter receives it. The fallback limit is 1,024 UTF-8 bytes. Known identifiers and categorical values use limits from 5 to 128 bytes, host and account descriptions use 256 bytes, endpoint identities and compact error/advice lists use 512 bytes, and normalized option values default to 512 bytes. `OptFlagsSet` remains at 1,024 bytes, while `OptEnvVarsSet` uses 512 bytes. Truncation preserves valid UTF-8 and appends `...(truncated)` whenever the property's limit can contain the marker.
 
 The example below is generated directly from the AzCopy serialization code (an on-prem-style block-blob upload from local disk to a public-cloud Blob account, with a few failed transfers).
 
 #### Event 2 — `azcopy.job.finished`
 
-The finished event carries the same property bag as started event plus `JobStatus`, `TerminalReason`, `TerminalStage`, and (when there were transfer failures) `FailureErrorCodes`, and adds all the numeric measurements.
+The finished event carries the same property bag as started event plus `JobStatus`, `TerminalStage`, and (when there were transfer failures) `FailureErrorCodes`, and adds all the numeric measurements.
 
-For the direct Application Insights backend, one event is sent in one `/v2.1/track` HTTP batch containing one envelope per measurement. Application Insights only retains the first metric when several metrics share one envelope, so finish events repeat the property bag across their measurement envelopes.
+For both backends, one event is sent in one `/v2.1/track` HTTP batch containing one packed envelope. A finished event has 50 entries in its `measurements` map without repeating the property bag. The exact production-shaped samples are in `SampleTelemetryPayloads.md`.
+
+Compact serialized sizes from the production serializer are approximately 1.7 KB for `job.started`, 3.9 KB for `job.finished`, and 5.6 KB for the paired transfer attempt. The previous metric-row representation was approximately 98-100 KB per paired attempt because it repeated dimensions across 51 rows.
+
+Current packed shape:
+
+```json
+{
+  "name": "Microsoft.ApplicationInsights.Event",
+  "time": "2026-07-26T12:00:00Z",
+  "iKey": "00000000-0000-0000-0000-000000000000",
+  "data": {
+    "baseType": "EventData",
+    "baseData": {
+      "ver": 2,
+      "name": "azcopy.job.finished",
+      "properties": {
+        "Command": "copy",
+        "JobStatus": "Completed",
+        "JobID": "b3f2c1a4-9d5e-4f8a-bc12-3456789abcde",
+        "AzCopyVersion": "10.32.2"
+      },
+      "measurements": {
+        "azcopy.job.finished": 1,
+        "azcopy.bytes_transferred": 5368709120,
+        "azcopy.objects_completed": 128,
+        "azcopy.job_duration_seconds": 42.5
+      }
+    }
+  }
+}
+```
+
+The older metric-envelope example below is retained only to document the superseded wire shape and must not be used for new queries.
 
 ```json
 {
@@ -311,7 +360,6 @@ For the direct Application Insights backend, one event is sent in one `/v2.1/tra
       ],
       "properties": {
         "BlobType": "BlockBlob",
-        "CloudType": "public",
         "SourceCloudType": "",
         "DestCloudType": "public",
         "Command": "copy",
@@ -322,21 +370,17 @@ For the direct Application Insights backend, one event is sent in one `/v2.1/tra
         "DestType": "Blob",
         "FailureErrorCodes": "403:2,500:1",
         "FromTo": "LocalBlob",
-        "GeoCountry": "United States",
-        "GeoRegion": "eastus",
-        "GeoTimezone": "America/New_York",
         "HostArch": "amd64",
         "HostCPUModel": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "HostMemoryTotalGB": "32",
         "HostNICSpeedMbps": "10000",
         "HostNumCPU": "8",
-        "HostVirtualization": "azure-vm",
+        "AzureVMDetected": "true",
         "InstallationID": "8f14e45fceea167a5a36dedd4bea2543",
         "InvocationContext": "ci",
         "JobStatus": "CompletedWithErrors",
         "JobErrorCategory": "transfer",
         "JobErrorCode": "transfer-failures",
-        "NetworkRunContext": "azure-vm",
         "OSType": "linux",
         "OSVersion": "Ubuntu 22.04.3 LTS",
         "OptBlockSizeMB": "8",
@@ -348,16 +392,14 @@ For the direct Application Insights backend, one event is sent in one `/v2.1/tra
         "OptPutMD5": "true",
         "OptRecursive": "true",
         "RequestedAccessTier": "Cool",
-        "RunID": "b3f2c1a4-9d5e-4f8a-bc12-3456789abcde",
-        "ServiceName": "azcopy",
-        "ServiceVersion": "10.32.2",
+        "JobID": "b3f2c1a4-9d5e-4f8a-bc12-3456789abcde",
+        "AzCopyVersion": "10.32.2",
         "SourceAuthMechanism": "Anonymous",
         "SourceMountType": "local-disk",
         "SourceProtocol": "local",
         "SourceStorageAccount": "",
         "SourceType": "Local",
-        "TransferDirection": "upload",
-        "TransferTopology": "local-to-azure"
+        "FromTo": "LocalBlob"
       }
     }
   }
@@ -409,21 +451,21 @@ Source scope metrics:
 Additional bounded dimensions and diagnostics:
 
 - `SourceScope` and `DestScope` identify service, container/share/bucket, object-or-prefix, local directory/object, stream, benchmark, or none without emitting paths.
-- When a recognized account/bucket identity cannot be parsed, `SourceEndpointIdentity`/`DestEndpointIdentity` contain only normalized scheme, hostname, and non-default port. User info, path, query, SAS, and fragment are removed.
+- Source and destination identity fields contain only normalized Azure storage account names. S3/GCS, custom domains, emulators, and unparseable endpoints emit no client identity.
 - Authentication distinguishes `SAS` from `PublicAnonymous`; local, pipe, benchmark, and none endpoints use `NotApplicable`.
-- `InvocationID` is a random 128-bit identifier for one command/job attempt. Paired start/finish events share it while `RunID` remains the resumable job key.
-- `PerformanceConstraint`, `PrimaryPerformanceAdviceCode`, and up to eight deduplicated `PerformanceAdviceCodes` are emitted; human-readable advice text is not.
+- `InvocationID` is a random 128-bit identifier for one command/job attempt. Paired start/finish events share it while `JobID` remains the resumable job key.
+- `PerformanceConstraint` and up to eight deduplicated `PerformanceAdviceCodes` are emitted in priority order; the first code is primary. Human-readable advice text is not emitted.
 - Main benchmark jobs use the same paired lifecycle with `Command=bench`. `BenchmarkMode`, `BenchmarkFileCount`, `BenchmarkFileSizeBytes`, `BenchmarkFolderCount`, `BenchmarkCleanupRequested`, and `BenchmarkIsCleanup` carry effective inputs on both events.
-- Benchmark results reuse `JobStatus`, `TerminalReason`, job-error fields, and generic finish diagnostics. No benchmark description or human-readable advice title/reason is emitted.
+- Benchmark results reuse `JobStatus`, `TerminalStage`, job-error fields, and generic finish diagnostics. No benchmark description or human-readable advice title/reason is emitted.
 - Automatic benchmark cleanup stays outside the benchmark event lifecycle. `BenchmarkIsCleanup=false` on main events makes the exclusion explicit; cleanup transfers emit no benchmark result.
 - `FailureErrorOtherCount` reports failed-transfer occurrences omitted when the error histogram is capped to ten distinct codes.
-- `HostNICSpeedAvailable` and `HostNICSpeedBucket` make unknown link speed explicit and support low-cardinality aggregation.
+- `HostNICSpeedBucket` makes unknown link speed explicit and supports low-cardinality aggregation.
 - `enumeration_phase_duration_seconds` measures progress-tracker start through final job-part dispatch. It overlaps transfer and must not be summed with transfer-phase duration.
 
 Network metric semantics:
 
 - `HostNICSpeedMbps` is the highest advertised link speed AzCopy can discover. It is best-effort and may not be the interface used for the transfer; `-1` means unknown.
-- `NetworkRunContext` classifies where AzCopy runs (`azure-vm`, `on-prem`, or `unknown`).
+- `AzureVMDetected` is `true` when Azure Instance Metadata Service responds and `false` otherwise. A `false` value does not prove that the host is on-premises or non-virtualized.
 - Job duration/throughput cover the entire attempt. Transfer-phase duration begins when the first job part is ordered and ends at terminal wait; it may overlap enumeration because AzCopy pipelines scanning and transfer.
 - `average_storage_http_attempt_e2e_ms` is the mean duration of a Storage HTTP attempt observed by the SDK per-retry policy. Retries are separate attempts; this is not logical-operation latency or network RTT.
 - Raw operation, network-error, and categorized HTTP 503 counts are emitted alongside percentages so aggregate rates can be calculated correctly.
@@ -432,24 +474,24 @@ Network metric semantics:
 
 Sampling and correlation:
 
-- `SchemaVersion=2`, `SamplingRate=0.01`, `SamplingUnit=job_id`, and `SamplerVersion=job-id-sha256-v1` are attached to every emitted event. Schema version 2 adds `SourceCloudType` and `DestCloudType`; the combined `CloudType` remains for compatibility.
+- `SchemaVersion=3`, the effective `SamplingRate`, and `SamplerVersion=job-id-sha256-v1` are attached to every emitted event. The sampler version defines JobID as the fixed sampling key, so a separate `SamplingUnit` property is not emitted. The default sampling rate is `0.01`; test and diagnostic runs can override it with the hidden `--telemetry-sampling-rate` flag using a value from `0.0` through `1.0`. The same effective value drives the JobID inclusion decision and the emitted metadata. Azure cloud environments are recorded independently as `SourceCloudType` and `DestCloudType`.
 - Inclusion is a deterministic SHA-256 threshold decision over `SamplerVersion + JobID`. The original and every resumed attempt sharing a JobID are therefore included or excluded together.
 - `InvocationID` and timestamps are not part of the sampling key. Raising the threshold creates a nested cohort without reshuffling existing JobIDs.
-- `InvocationID` identifies one command/job attempt; paired start/finish events share it. `RunID` remains the resumable job key.
-- `AttemptType` is `original` for copy/sync/benchmark and `resume` for a resumed attempt. Resume reuses the original `RunID` but receives a new `InvocationID`.
-- `MeasurementScope` is `attempt` for original attempts and `job-cumulative` for resume. AzCopy job plans retain cumulative transfer totals across resumes, so resume outcome/rate queries are valid but resume byte/object measurements must not be summed as attempt deltas.
+- `InvocationID` identifies one command/job attempt; paired start/finish events share it. `JobID` remains the resumable job key across the original and resumed invocations.
+- `Command=jobs.resume` identifies resume attempts without a duplicate attempt-type property.
+- Resume events emit `SummaryCounterScope=job-cumulative` because job-plan byte/object/outcome and Storage-operation summary counters retain cumulative totals. Attempt and phase durations always describe the current invocation. Original attempts omit `SummaryCounterScope` because their summary counters and durations both describe that attempt.
+- `FromTo` is the canonical source/destination classification. Dashboards derive transfer direction and provider topology from `FromTo`, `SourceType`, and `DestType` instead of receiving duplicate properties.
 
 Terminal lifecycle:
 
 - Every non-dry-run copy/sync/benchmark attempt that emits `job.started` defers exactly one `job.finished`, including enumeration failure, manager failure, and explicit context cancellation paths. Accepted resume attempts use the same lifecycle around the resume request and terminal wait.
-- `TerminalReason` is one of `completed`, `completed-with-errors`, `failed`, or `cancelled`.
 - `TerminalStage` is a bounded lifecycle value (`initialization`, `enumeration`, `transfer`, `completion`, or `completed`). Successful and partial-success finishes use `completed`; failures and cancellations retain the active stage.
 - The finish event is emitted before job-manager cleanup so the finalizer can read the live summary and progress counters. Cancellation classification also checks the attempt context, because a terminal wait can return a different error after cancellation.
 - Process crashes, forced termination, and machine loss cannot run the finalizer. Ingestion must classify a sampled start without a matching finish after a defined timeout as probable abandonment, not explicit cancellation.
 
 Job-level error classification:
 
-- Failed and partial-success finish events can include `JobErrorCategory` and `JobErrorCode`. Completed and cancelled events leave both empty because cancellation is represented by `TerminalReason` rather than treated as an error.
+- Failed and partial-success finish events can include `JobErrorCategory` and `JobErrorCode`. Completed and cancelled events leave both empty; cancellation is represented by `JobStatus=Cancelled` rather than treated as an error.
 - Categories are bounded to authentication, authorization, throttling, timeout, network, local I/O, conflict, not found, service, AzCopy internal, lifecycle-stage fallback, or unknown.
 - Typed Azure `ResponseError` values retain a service `ErrorCode` only when it is at most 64 ASCII characters and contains only letters, digits, `_`, `-`, or `.`. When no safe service code exists, the classifier emits a fixed HTTP-status or generic code.
 - Context deadlines, network errors, local path errors, and AzCopy internal errors use fixed machine-readable codes. Untyped failures fall back to the bounded terminal stage, such as `enumeration-error` or `transfer-error`.
@@ -553,7 +595,7 @@ The following resources will have to be provisioned as part of ADO pipeline asso
 • Capture the AzCopy Job ID from structured output for correlation.
 9. Validate App Insights ingestion
 • Poll for up to approximately ten minutes to account for ingestion latency.
-• Query  customMetrics / AppMetrics  using the captured  RunID .
+• Query `customEvents` / `AppEvents` using the captured `JobID`.
 • Assert:
 • One  azcopy.job.started  and one  azcopy.job.finished .
 • Matching  InvocationID .

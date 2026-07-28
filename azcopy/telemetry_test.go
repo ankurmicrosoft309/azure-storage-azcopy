@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strings"
@@ -38,25 +39,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTransferDirection(t *testing.T) {
-	a := assert.New(t)
-	a.Equal("upload", transferDirection(common.EFromTo.LocalBlob()))
-	a.Equal("download", transferDirection(common.EFromTo.BlobLocal()))
-	a.Equal("s2s", transferDirection(common.EFromTo.BlobBlob()))
-	a.Equal("delete", transferDirection(common.EFromTo.BlobTrash()))
-}
-
 func TestBaseJobDimensions(t *testing.T) {
 	a := assert.New(t)
 	d := baseJobDimensions("copy", common.EFromTo.LocalBlob(), common.ECredentialType.OAuthToken(), common.ECredentialType.SharedKey())
 	a.Equal("copy", d.Command)
-	a.Equal("original", d.AttemptType)
-	a.Equal("attempt", d.MeasurementScope)
+	a.Empty(d.SummaryCounterScope)
 	a.Equal(common.EFromTo.LocalBlob().String(), d.FromTo)
 	a.Equal(common.ELocation.Local().String(), d.SourceType)
 	a.Equal(common.ELocation.Blob().String(), d.DestType)
-	a.Equal("upload", d.TransferDirection)
-	a.Equal("local-to-azure", d.TransferTopology)
 	a.Equal("local", d.SourceProtocol)
 	a.Equal("local-disk", d.SourceMountType)
 	a.Equal("https", d.DestProtocol)
@@ -131,17 +121,6 @@ func TestMountTypeForLocation(t *testing.T) {
 	a.Equal("cloud-gcs", mountTypeForLocation(common.ELocation.GCP()))
 }
 
-func TestTransferTopology(t *testing.T) {
-	a := assert.New(t)
-	a.Equal("local-to-azure", transferTopology(common.EFromTo.LocalBlob()))
-	a.Equal("azure-to-local", transferTopology(common.EFromTo.BlobLocal()))
-	a.Equal("intra-azure", transferTopology(common.EFromTo.BlobBlob()))
-	a.Equal("aws-to-azure", transferTopology(common.EFromTo.S3Blob()))
-	a.Equal("gcs-to-azure", transferTopology(common.EFromTo.GCPBlob()))
-	a.Equal("cross-cloud", transferTopology(common.FromToValue(common.ELocation.S3(), common.ELocation.GCP())))
-	a.Equal("azure-delete", transferTopology(common.EFromTo.BlobTrash()))
-}
-
 func TestEndpointKind(t *testing.T) {
 	a := assert.New(t)
 	a.Equal("public", endpointKind(
@@ -156,23 +135,6 @@ func TestEndpointKind(t *testing.T) {
 		common.ELocation.Local()))
 }
 
-func TestCloudType(t *testing.T) {
-	a := assert.New(t)
-	pub := common.ResourceString{Value: "https://acct.blob.core.windows.net/c"}
-	gov := common.ResourceString{Value: "https://acct.blob.core.usgovcloudapi.net/c"}
-	china := common.ResourceString{Value: "https://acct.blob.core.chinacloudapi.cn/c"}
-	local := common.ResourceString{Value: "/local/path"}
-
-	a.Equal("public", cloudType(local, common.ELocation.Local(), pub, common.ELocation.Blob()))
-	a.Equal("gov", cloudType(gov, common.ELocation.Blob(), local, common.ELocation.Local()))
-	a.Equal("china", cloudType(local, common.ELocation.Local(), china, common.ELocation.Blob()))
-	// Azure host with unknown suffix defaults to public.
-	a.Equal("public", cloudType(local, common.ELocation.Local(),
-		common.ResourceString{Value: "https://acct.blob.example.com/c"}, common.ELocation.Blob()))
-	// Neither endpoint Azure -> empty.
-	a.Equal("", cloudType(local, common.ELocation.Local(), local, common.ELocation.Local()))
-}
-
 func TestEndpointCloudType(t *testing.T) {
 	a := assert.New(t)
 	a.Equal("public", endpointCloudType(
@@ -183,83 +145,12 @@ func TestEndpointCloudType(t *testing.T) {
 		common.ResourceString{Value: "https://acct.blob.core.chinacloudapi.cn/c"}, common.ELocation.Blob()))
 	a.Equal("germany", endpointCloudType(
 		common.ResourceString{Value: "https://acct.blob.core.cloudapi.de/c"}, common.ELocation.Blob()))
-	a.Equal("public", endpointCloudType(
+	a.Equal("unknown", endpointCloudType(
 		common.ResourceString{Value: "https://acct.blob.example.com/c"}, common.ELocation.Blob()))
 	a.Empty(endpointCloudType(
 		common.ResourceString{Value: "https://s3.amazonaws.com/bucket"}, common.ELocation.S3()))
 	a.Empty(endpointCloudType(
 		common.ResourceString{Value: "/local/path"}, common.ELocation.Local()))
-}
-
-func TestCountryFromLocale(t *testing.T) {
-	a := assert.New(t)
-	a.Equal("US", countryFromLocale("en_US.UTF-8"))
-	a.Equal("GB", countryFromLocale("en_GB"))
-	a.Equal("DE", countryFromLocale("de_DE.UTF-8@euro"))
-	a.Equal("", countryFromLocale("C"))
-	a.Equal("", countryFromLocale("POSIX"))
-	a.Equal("", countryFromLocale(""))
-	a.Equal("", countryFromLocale("en"))
-}
-
-func TestZoneNameFromZoneinfoPath(t *testing.T) {
-	a := assert.New(t)
-	a.Equal("America/Los_Angeles", zoneNameFromZoneinfoPath("/usr/share/zoneinfo/America/Los_Angeles"))
-	a.Equal("Europe/Berlin", zoneNameFromZoneinfoPath("../usr/share/zoneinfo/Europe/Berlin"))
-	a.Equal("", zoneNameFromZoneinfoPath("/etc/localtime"))
-}
-
-func TestGeoTimezoneFrom(t *testing.T) {
-	a := assert.New(t)
-	// TZ env takes precedence.
-	tz := geoTimezoneFrom(
-		func(k string) string {
-			if k == "TZ" {
-				return "America/New_York"
-			}
-			return ""
-		},
-		func(string) ([]byte, error) { return nil, assertErr() },
-		func(string) (string, error) { return "", assertErr() },
-		func() string { return "UTC" })
-	a.Equal("America/New_York", tz)
-
-	// Falls back through /etc/timezone.
-	tz = geoTimezoneFrom(
-		func(string) string { return "" },
-		func(p string) ([]byte, error) {
-			if p == "/etc/timezone" {
-				return []byte("Europe/London\n"), nil
-			}
-			return nil, assertErr()
-		},
-		func(string) (string, error) { return "", assertErr() },
-		func() string { return "UTC" })
-	a.Equal("Europe/London", tz)
-
-	// Falls back through /etc/localtime symlink.
-	tz = geoTimezoneFrom(
-		func(string) string { return "" },
-		func(string) ([]byte, error) { return nil, assertErr() },
-		func(string) (string, error) { return "/usr/share/zoneinfo/Asia/Kolkata", nil },
-		func() string { return "UTC" })
-	a.Equal("Asia/Kolkata", tz)
-
-	// Ultimate fallback to zone abbreviation.
-	tz = geoTimezoneFrom(
-		func(string) string { return "" },
-		func(string) ([]byte, error) { return nil, assertErr() },
-		func(string) (string, error) { return "", assertErr() },
-		func() string { return "PST" })
-	a.Equal("PST", tz)
-}
-
-func TestVirtualizationAndNetworkContext(t *testing.T) {
-	a := assert.New(t)
-	a.Equal("azure-vm", virtualization(true))
-	a.Equal("unknown", virtualization(false))
-	a.Equal("azure-vm", networkRunContext(true))
-	a.Equal("on-prem", networkRunContext(false))
 }
 
 func TestNICSpeedBucket(t *testing.T) {
@@ -269,10 +160,6 @@ func TestNICSpeedBucket(t *testing.T) {
 	assert.Equal(t, "10-<40gbps", nicSpeedBucket(10000))
 	assert.Equal(t, ">=40gbps", nicSpeedBucket(40000))
 }
-
-func assertErr() error { return errTest }
-
-var errTest = errors.New("test error")
 
 func TestCopyJobDimensions(t *testing.T) {
 	a := assert.New(t)
@@ -295,7 +182,6 @@ func TestCopyJobDimensions(t *testing.T) {
 	a.Equal(common.ECredentialType.OAuthToken().String(), d.DestAuthMechanism)
 	a.Empty(d.SourceCloudType)
 	a.Equal("public", d.DestCloudType)
-	a.Equal("public", d.CloudType)
 	a.Equal([]string{"block-size-mb", "put-md5", "recursive"}, d.Options.FlagsSet)
 	a.Equal("8", d.Options.Values["OptBlockSizeMB"])
 	o.telemetryOptions.FlagsSet[0] = "mutated"
@@ -311,10 +197,9 @@ func TestCopyJobDimensionsS3ToAzureGovernment(t *testing.T) {
 		destination: common.ResourceString{Value: "https://account.blob.core.usgovcloudapi.net/container"},
 	}
 	dimensions := copyJobDimensions(o, common.ECredentialType.S3AccessKey(), common.ECredentialType.OAuthToken())
-	assert.Equal(t, "aws-to-azure", dimensions.TransferTopology)
+	assert.Equal(t, "S3Blob", dimensions.FromTo)
 	assert.Empty(t, dimensions.SourceCloudType)
 	assert.Equal(t, "gov", dimensions.DestCloudType)
-	assert.Equal(t, "gov", dimensions.CloudType)
 }
 
 func TestCopyJobDimensionsBenchmark(t *testing.T) {
@@ -402,8 +287,7 @@ func TestResumeJobDimensions(t *testing.T) {
 		options,
 	)
 	assert.Equal(t, "jobs.resume", dimensions.Command)
-	assert.Equal(t, "resume", dimensions.AttemptType)
-	assert.Equal(t, "job-cumulative", dimensions.MeasurementScope)
+	assert.Equal(t, "job-cumulative", dimensions.SummaryCounterScope)
 	assert.Equal(t, "NotApplicable", dimensions.SourceAuthMechanism)
 	assert.Equal(t, "SAS", dimensions.DestAuthMechanism)
 	assert.Equal(t, "account", dimensions.DestStorageAccount)
@@ -477,14 +361,13 @@ func TestBuildFinishedEvent(t *testing.T) {
 	}
 	evt := buildFinishedEvent(telemetryResourceForTest(), dims, "job-1234", "invocation-1234", start, end, summary, 2*time.Second, 1500*time.Millisecond, time.Second, shape)
 
-	a.Equal("job-1234", evt.RunID)
+	a.Equal("job-1234", evt.JobID)
 	a.Equal("invocation-1234", evt.InvocationID)
 	a.Equal(int64(1), evt.FinishedCount)
 	a.Equal(common.EJobStatus.Completed().String(), evt.JobStatus)
 	a.Equal("403:3,500:1", evt.FailureErrorCodes)
 	a.Equal(int64(0), evt.FailureErrorOtherCount)
 	a.Equal(common.EPerfConstraint.Service().String(), evt.PerformanceConstraint)
-	a.Equal("NetworkErrors", evt.PrimaryPerformanceAdviceCode)
 	a.Equal([]string{"NetworkErrors", "ConcurrencyHitUpperLimit"}, evt.PerformanceAdviceCodes)
 	a.Equal(100.0, evt.PercentComplete)
 	a.Equal(int64(1500000), evt.BytesEnumerated)
@@ -577,9 +460,8 @@ func TestPerformanceAdviceAttributes(t *testing.T) {
 		{Code: "invalid value"},
 		{Code: "AccountIOPS"},
 	}
-	constraint, primary, codes := performanceAdviceAttributes(common.EPerfConstraint.Service(), advice)
+	constraint, codes := performanceAdviceAttributes(common.EPerfConstraint.Service(), advice)
 	assert.Equal(t, common.EPerfConstraint.Service().String(), constraint)
-	assert.Equal(t, "NetworkErrors", primary)
 	assert.Equal(t, []string{"NetworkErrors", "AccountIOPS"}, codes)
 }
 
@@ -592,34 +474,28 @@ func TestStorageAccountName(t *testing.T) {
 	a.Equal("acct2", storageAccountName(
 		common.ResourceString{Value: "https://acct2.dfs.core.windows.net/fs"},
 		common.ELocation.BlobFS()))
+	a.Equal("privateacct", storageAccountName(
+		common.ResourceString{Value: "https://privateacct.privatelink.blob.core.windows.net/container"},
+		common.ELocation.Blob()))
+	// Azure-typed custom endpoints do not emit a hostname-derived identity.
+	a.Equal("", storageAccountName(
+		common.ResourceString{Value: "https://acct.blob.example.com/container"},
+		common.ELocation.Blob()))
 	// Local locations return empty.
 	a.Equal("", storageAccountName(
 		common.ResourceString{Value: "/local/path"},
 		common.ELocation.Local()))
-	// S3/GCP return the bucket name.
-	a.Equal("bucket", storageAccountName(
+	// Non-Azure providers never emit bucket names.
+	a.Equal("", storageAccountName(
 		common.ResourceString{Value: "https://bucket.s3.amazonaws.com/key"},
 		common.ELocation.S3()))
-	a.Equal("mybucket", storageAccountName(
+	a.Equal("", storageAccountName(
 		common.ResourceString{Value: "https://storage.cloud.google.com/mybucket/object"},
 		common.ELocation.GCP()))
 	// Hostless values return empty.
 	a.Equal("", storageAccountName(
 		common.ResourceString{Value: "relative/path"},
 		common.ELocation.Blob()))
-}
-
-func TestSanitizedEndpointIdentity(t *testing.T) {
-	assert.Equal(t, "https://custom.example.com:8443", sanitizedEndpointIdentity(
-		common.ResourceString{Value: "https://user@CUSTOM.example.com:8443/container/path?secret=value#fragment"},
-		common.ELocation.Blob()))
-	assert.Equal(t, "https://custom.example.com", sanitizedEndpointIdentity(
-		common.ResourceString{Value: "https://custom.example.com:443/container"},
-		common.ELocation.Blob()))
-	assert.Empty(t, sanitizedEndpointIdentity(
-		common.ResourceString{Value: "https://account.blob.core.windows.net/container"},
-		common.ELocation.Blob()))
-	assert.Empty(t, sanitizedEndpointIdentity(common.ResourceString{Value: "local/path"}, common.ELocation.Local()))
 }
 
 func TestAuthMechanism(t *testing.T) {
@@ -689,8 +565,31 @@ func TestBuildResourceAttributesSamplingMetadata(t *testing.T) {
 	resource := buildResourceAttributes()
 	assert.Equal(t, telemetrySchemaVersion, resource.SchemaVersion)
 	assert.Equal(t, telemetrySamplingRate, resource.SamplingRate)
-	assert.Equal(t, telemetrySamplingUnit, resource.SamplingUnit)
 	assert.Equal(t, telemetrySamplerVersion, resource.SamplerVersion)
+}
+
+func TestConfigureTelemetrySamplingRate(t *testing.T) {
+	original := telemetrySamplingRate
+	t.Cleanup(func() { telemetrySamplingRate = original })
+
+	assert.NoError(t, configureTelemetrySamplingRate(nil))
+	assert.Equal(t, defaultTelemetrySamplingRate, telemetrySamplingRate)
+
+	for _, rate := range []float64{0, 0.25, 1} {
+		rate := rate
+		t.Run(fmt.Sprintf("rate-%g", rate), func(t *testing.T) {
+			assert.NoError(t, configureTelemetrySamplingRate(&rate))
+			assert.Equal(t, rate, telemetrySamplingRate)
+			assert.Equal(t, rate, buildResourceAttributes().SamplingRate)
+		})
+	}
+
+	for _, rate := range []float64{-0.01, 1.01, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		rate := rate
+		t.Run(fmt.Sprintf("invalid-%v", rate), func(t *testing.T) {
+			assert.Error(t, configureTelemetrySamplingRate(&rate))
+		})
+	}
 }
 
 func TestConfiguredTelemetryConnectionString(t *testing.T) {
@@ -820,7 +719,6 @@ func TestDisabledAgentIsNoop(t *testing.T) {
 
 func telemetryResourceForTest() telemetry.ResourceAttributes {
 	return telemetry.ResourceAttributes{
-		ServiceName:    "azcopy",
-		ServiceVersion: common.AzcopyVersion,
+		AzCopyVersion: common.AzcopyVersion,
 	}
 }

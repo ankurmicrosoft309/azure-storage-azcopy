@@ -2,12 +2,16 @@
 // Run from: azcore.centralus.kusto.windows.net / Xstore
 // This is account/time correlation, not exact job-to-request attribution.
 // Additional dashboard parameter: _account (free text, default empty)
-let ClientMetrics = cluster('https://adx.monitor.azure.com/subscriptions/31347be8-d066-464e-9866-7e58d85027b7/resourcegroups/sharankur_playground/providers/microsoft.insights/components/sharankur_insights1').database('sharankur_insights1').customMetrics
+let ClientMetrics = cluster('https://adx.monitor.azure.com/subscriptions/31347be8-d066-464e-9866-7e58d85027b7/resourcegroups/sharankur_playground/providers/microsoft.insights/components/sharankur_insights1').database('sharankur_insights1').customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | extend
     InvocationID = tostring(customDimensions.InvocationID),
-    AccountValue = tostring(customDimensions.DestStorageAccount),
+    AccountValue = iif(tostring(customDimensions.DestType) in ('Blob', 'BlobFS', 'File', 'FileNFS'), tostring(customDimensions.DestStorageAccount), ''),
     SamplingRateValue = todouble(customDimensions.SamplingRate)
 | where isnotempty(InvocationID) and name != 'azcopy.command.invoked'
 | summarize

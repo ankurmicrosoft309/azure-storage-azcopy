@@ -1,12 +1,16 @@
 // Visual: Multi stat
 // Data source: sharankur_insights1 (Application Insights)
 // Dashboard parameters: _startTime, _endTime
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | extend
     InvocationID = tostring(customDimensions.InvocationID),
-    JobID = tostring(customDimensions.RunID),
+    JobID = tostring(coalesce(customDimensions.JobID, customDimensions.RunID)),
     JobStatusValue = tostring(customDimensions.JobStatus),
     SamplingRateValue = todouble(customDimensions.SamplingRate)
 | where isnotempty(InvocationID) and name != 'azcopy.command.invoked'

@@ -1,20 +1,21 @@
 // Visual: Table
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | where name == 'azcopy.job.finished'
 | project
     timestamp,
     InvocationID = tostring(customDimensions.InvocationID),
-    RunID = tostring(customDimensions.RunID),
+    JobID = tostring(coalesce(customDimensions.JobID, customDimensions.RunID)),
     Command = tostring(customDimensions.Command),
-    AttemptType = tostring(customDimensions.AttemptType),
-    MeasurementScope = tostring(customDimensions.MeasurementScope),
+    SummaryCounterScope = tostring(coalesce(customDimensions.SummaryCounterScope, iif(tostring(customDimensions.MeasurementScope) == 'job-cumulative', 'job-cumulative', ''))),
     JobStatus = tostring(customDimensions.JobStatus),
-    TerminalReason = tostring(customDimensions.TerminalReason),
     TerminalStage = tostring(customDimensions.TerminalStage),
     PerformanceConstraint = tostring(customDimensions.PerformanceConstraint),
-    PerformanceAdvice = tostring(customDimensions.PrimaryPerformanceAdviceCode),
     SourceProtocol = tostring(customDimensions.SourceProtocol),
     SourceMountType = tostring(customDimensions.SourceMountType),
     SourceScope = tostring(customDimensions.SourceScope),

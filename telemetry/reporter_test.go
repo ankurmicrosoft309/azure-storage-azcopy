@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,28 +74,24 @@ func sampleStarted() JobStartedEvent {
 	ts := time.Date(2026, 6, 23, 10, 0, 0, 0, time.UTC)
 	return JobStartedEvent{
 		Resource: ResourceAttributes{
-			ServiceName:      "azcopy",
-			ServiceVersion:   "10.32.2",
+			AzCopyVersion:    "10.32.2",
 			SchemaVersion:    "1",
 			SamplingRate:     0.01,
-			SamplingUnit:     "job_id",
 			SamplerVersion:   "job-id-sha256-v1",
 			OSType:           "linux",
 			HostArch:         "amd64",
 			HostNumCPU:       8,
 			HostNICSpeedMbps: -1,
+			AzureVMDetected:  true,
 			InstallationID:   "abc123",
 		},
 		Dimensions: JobDimensions{
-			Command:          "copy",
-			AttemptType:      "original",
-			MeasurementScope: "attempt",
-			FromTo:           "LocalBlob",
-			SourceType:       "Local",
-			DestType:         "Blob",
-			SourceCloudType:  "",
-			DestCloudType:    "public",
-			CloudType:        "public",
+			Command:         "copy",
+			FromTo:          "LocalBlob",
+			SourceType:      "Local",
+			DestType:        "Blob",
+			SourceCloudType: "",
+			DestCloudType:   "public",
 			Options: OptionAttributes{
 				FlagsSet: []string{"recursive", "put-md5"},
 				Values: map[string]string{
@@ -103,7 +100,7 @@ func sampleStarted() JobStartedEvent {
 				},
 			},
 		},
-		RunID:        "job-1234",
+		JobID:        "job-1234",
 		InvocationID: "invocation-1234",
 		Timestamp:    ts,
 		StartedCount: 1,
@@ -115,19 +112,17 @@ func sampleFinished() JobFinishedEvent {
 	return JobFinishedEvent{
 		Resource:                        sampleStarted().Resource,
 		Dimensions:                      sampleStarted().Dimensions,
-		RunID:                           "job-1234",
+		JobID:                           "job-1234",
 		InvocationID:                    "invocation-1234",
 		StartTimestamp:                  start,
 		EndTimestamp:                    start.Add(time.Minute),
 		FinishedCount:                   1,
 		JobStatus:                       "CompletedWithErrors",
-		TerminalReason:                  "completed-with-errors",
 		TerminalStage:                   "completed",
 		JobErrorCategory:                "transfer",
 		JobErrorCode:                    "transfer-failures",
 		FailureErrorOtherCount:          2,
 		PerformanceConstraint:           "Service",
-		PrimaryPerformanceAdviceCode:    "NetworkErrors",
 		PerformanceAdviceCodes:          []string{"NetworkErrors", "AccountIOPS"},
 		BytesEnumerated:                 2048,
 		BytesExpected:                   1536,
@@ -283,7 +278,7 @@ func TestCommandInvokedEvent(t *testing.T) {
 			FlagsSet: []string{"method", "tenant"},
 			Values:   map[string]string{"OptLoginType": "device"},
 		},
-		RunID:        "job-9999",
+		JobID:        "job-9999",
 		InvocationID: "invocation-9999",
 		Timestamp:    ts,
 		InvokedCount: 1,
@@ -300,41 +295,59 @@ func TestCommandInvokedEvent(t *testing.T) {
 	assert.Equal(t, "login", attrs["Command"])
 	assert.Equal(t, "method,tenant", attrs["OptFlagsSet"])
 	assert.Equal(t, "device", attrs["OptLoginType"])
-	assert.Equal(t, "job-9999", attrs["RunID"])
+	assert.Equal(t, "job-9999", attrs["JobID"])
 	assert.Equal(t, "invocation-9999", attrs["InvocationID"])
 	// Resource attributes are included.
-	assert.Equal(t, "azcopy", attrs["ServiceName"])
+	assert.Equal(t, "10.32.2", attrs["AzCopyVersion"])
+	_, hasServiceName := attrs["ServiceName"]
+	assert.False(t, hasServiceName)
+	_, hasServiceVersion := attrs["ServiceVersion"]
+	assert.False(t, hasServiceVersion)
 	// No job dimensions on a command.invoked event.
 	_, hasFromTo := attrs["FromTo"]
 	assert.False(t, hasFromTo)
 
-	// Empty RunID is omitted.
-	e.RunID = ""
-	_, hasRunID := e.attributes()["RunID"]
-	assert.False(t, hasRunID)
+	// Empty JobID is omitted.
+	e.JobID = ""
+	_, hasJobID := e.attributes()["JobID"]
+	assert.False(t, hasJobID)
 }
 
 func TestAttributesIncludeResourceAndDimensions(t *testing.T) {
 	attrs := sampleFinished().attributes()
-	assert.Equal(t, "azcopy", attrs["ServiceName"])
+	assert.Equal(t, "10.32.2", attrs["AzCopyVersion"])
+	_, hasServiceName := attrs["ServiceName"]
+	assert.False(t, hasServiceName)
+	_, hasServiceVersion := attrs["ServiceVersion"]
+	assert.False(t, hasServiceVersion)
 	assert.Equal(t, "1", attrs["SchemaVersion"])
 	assert.Equal(t, "0.01", attrs["SamplingRate"])
-	assert.Equal(t, "job_id", attrs["SamplingUnit"])
+	_, hasSamplingUnit := attrs["SamplingUnit"]
+	assert.False(t, hasSamplingUnit)
 	assert.Equal(t, "job-id-sha256-v1", attrs["SamplerVersion"])
+	assert.Equal(t, "true", attrs["AzureVMDetected"])
+	_, hasHostVirtualization := attrs["HostVirtualization"]
+	assert.False(t, hasHostVirtualization)
+	_, hasNetworkRunContext := attrs["NetworkRunContext"]
+	assert.False(t, hasNetworkRunContext)
 	assert.Equal(t, "copy", attrs["Command"])
-	assert.Equal(t, "original", attrs["AttemptType"])
-	assert.Equal(t, "attempt", attrs["MeasurementScope"])
+	_, hasAttemptType := attrs["AttemptType"]
+	assert.False(t, hasAttemptType)
+	_, hasMeasurementScope := attrs["MeasurementScope"]
+	assert.False(t, hasMeasurementScope)
 	assert.Equal(t, "true", attrs["OptRecursive"])
 	assert.Equal(t, "8", attrs["OptBlockSizeMB"])
 	assert.Equal(t, "recursive,put-md5", attrs["OptFlagsSet"])
 	// JobStatus is only present on the finished event.
 	assert.Equal(t, "CompletedWithErrors", attrs["JobStatus"])
-	assert.Equal(t, "completed-with-errors", attrs["TerminalReason"])
+	_, hasTerminalReason := attrs["TerminalReason"]
+	assert.False(t, hasTerminalReason)
 	assert.Equal(t, "completed", attrs["TerminalStage"])
 	assert.Equal(t, "transfer", attrs["JobErrorCategory"])
 	assert.Equal(t, "transfer-failures", attrs["JobErrorCode"])
 	assert.Equal(t, "Service", attrs["PerformanceConstraint"])
-	assert.Equal(t, "NetworkErrors", attrs["PrimaryPerformanceAdviceCode"])
+	_, hasPrimaryAdvice := attrs["PrimaryPerformanceAdviceCode"]
+	assert.False(t, hasPrimaryAdvice)
 	assert.Equal(t, "NetworkErrors,AccountIOPS", attrs["PerformanceAdviceCodes"])
 	_, hasStatus := sampleStarted().attributes()["JobStatus"]
 	assert.False(t, hasStatus)
@@ -360,23 +373,20 @@ func TestBenchmarkDimensionsProperties(t *testing.T) {
 
 func TestResumeDimensionsProperties(t *testing.T) {
 	properties := JobDimensions{
-		Command:          "jobs.resume",
-		AttemptType:      "resume",
-		MeasurementScope: "job-cumulative",
+		Command:             "jobs.resume",
+		SummaryCounterScope: "job-cumulative",
 	}.props()
 	assert.Equal(t, "jobs.resume", properties["Command"])
-	assert.Equal(t, "resume", properties["AttemptType"])
-	assert.Equal(t, "job-cumulative", properties["MeasurementScope"])
+	assert.Equal(t, "job-cumulative", properties["SummaryCounterScope"])
 }
 
-func TestRunIDCorrelatesEvents(t *testing.T) {
-	// The started and finished events for a single run share the same RunID,
-	// emitted as the "RunID" property so the two can be joined.
+func TestJobIDCorrelatesEvents(t *testing.T) {
+	// The started and finished events for an attempt share JobID and InvocationID.
 	started := sampleStarted().attributes()
 	finished := sampleFinished().attributes()
-	assert.Equal(t, "job-1234", started["RunID"])
-	assert.Equal(t, "job-1234", finished["RunID"])
-	assert.Equal(t, started["RunID"], finished["RunID"])
+	assert.Equal(t, "job-1234", started["JobID"])
+	assert.Equal(t, "job-1234", finished["JobID"])
+	assert.Equal(t, started["JobID"], finished["JobID"])
 	assert.Equal(t, "invocation-1234", started["InvocationID"])
 	assert.Equal(t, started["InvocationID"], finished["InvocationID"])
 }
@@ -399,6 +409,73 @@ func TestOptFlagsSetTruncation(t *testing.T) {
 	assert.NotContains(t, short["OptFlagsSet"], "truncated")
 }
 
+func TestBoundPropertiesAppliesDefaultAndSpecificLimits(t *testing.T) {
+	oversized := strings.Repeat("x", maxPropValueLen+100)
+	properties := map[string]string{
+		"FutureProperty": oversized,
+		"OptFutureValue": oversized,
+	}
+	for name := range propertyValueLimits {
+		properties[name] = oversized
+	}
+
+	boundProperties(properties)
+	for name, value := range properties {
+		assert.LessOrEqual(t, len(value), propertyValueLimit(name), name)
+		if propertyValueLimit(name) > len(truncatedPropertyMarker) {
+			assert.True(t, strings.HasSuffix(value, truncatedPropertyMarker), name)
+		}
+	}
+	assert.Len(t, properties["OptFutureValue"], maxOptionValueLen)
+	assert.Len(t, properties["FutureProperty"], maxPropValueLen)
+}
+
+func TestTruncateValueToPreservesUTF8(t *testing.T) {
+	value := strings.Repeat("界", maxPropValueLen)
+	truncated := truncateValueTo(value, maxPropValueLen)
+
+	assert.LessOrEqual(t, len(truncated), maxPropValueLen)
+	assert.True(t, utf8.ValidString(truncated))
+	assert.True(t, strings.HasSuffix(truncated, truncatedPropertyMarker))
+}
+
+func TestEventPropertiesAreBoundedBeforeExport(t *testing.T) {
+	oversized := strings.Repeat("x", maxPropValueLen+100)
+	event := sampleFinished()
+	event.Resource.OSVersion = oversized
+	event.Resource.HostCPUModel = oversized
+	event.Dimensions.SourceStorageAccount = oversized
+	event.Dimensions.Options = OptionAttributes{
+		FlagsSet: []string{oversized, oversized},
+		Values:   map[string]string{"OptFutureValue": oversized},
+	}
+	event.JobID = oversized
+	event.InvocationID = oversized
+	event.JobStatus = oversized
+	event.FailureErrorCodes = oversized
+
+	envelope := eventToEnvelopes("ikey-1", event)[0]
+	for name, value := range envelope.Data.BaseData.Properties {
+		assert.LessOrEqual(t, len(value), propertyValueLimit(name), name)
+	}
+	assert.Len(t, envelope.Data.BaseData.Properties["OSVersion"], maxHostValueLen)
+	assert.Len(t, envelope.Data.BaseData.Properties["JobID"], maxIdentifierValueLen)
+	assert.Len(t, envelope.Data.BaseData.Properties["OptFutureValue"], maxOptionValueLen)
+
+	command := CommandInvokedEvent{
+		Resource:     event.Resource,
+		Command:      oversized,
+		Options:      event.Dimensions.Options,
+		JobID:        oversized,
+		InvocationID: oversized,
+		Timestamp:    time.Now(),
+		InvokedCount: 1,
+	}
+	for name, value := range command.attributes() {
+		assert.LessOrEqual(t, len(value), propertyValueLimit(name), name)
+	}
+}
+
 func TestUnsetOptionsAreOmitted(t *testing.T) {
 	attrs := JobDimensions{Command: "copy"}.props()
 	for _, key := range []string{"OptFlagsSet", "OptEnvVarsSet", "OptRecursive", "OptBlockSizeMB", "OptConcurrency"} {
@@ -417,19 +494,26 @@ func TestMergeProps(t *testing.T) {
 
 func TestEventToEnvelopes(t *testing.T) {
 	envelopes := eventToEnvelopes("ikey-1", sampleFinished())
-	require.Len(t, envelopes, 50)
-	for _, envelope := range envelopes {
-		assert.Equal(t, "Microsoft.ApplicationInsights.Metric", envelope.Name)
-		assert.Equal(t, "ikey-1", envelope.IKey)
-		assert.Equal(t, "MetricData", envelope.Data.BaseType)
-		assert.Len(t, envelope.Data.BaseData.Metrics, 1)
-		assert.Equal(t, "copy", envelope.Data.BaseData.Properties["Command"])
-	}
-	assert.Equal(t, "", envelopes[0].Data.BaseData.Properties["SourceCloudType"])
-	assert.Equal(t, "public", envelopes[0].Data.BaseData.Properties["DestCloudType"])
-	assert.Equal(t, "public", envelopes[0].Data.BaseData.Properties["CloudType"])
-	assert.Equal(t, "azcopy.job.finished", envelopes[0].Data.BaseData.Metrics[0].Name)
-	assert.Equal(t, "azcopy.percent_complete", envelopes[49].Data.BaseData.Metrics[0].Name)
+	require.Len(t, envelopes, 1)
+	envelope := envelopes[0]
+	assert.Equal(t, "Microsoft.ApplicationInsights.Event", envelope.Name)
+	assert.Equal(t, "ikey-1", envelope.IKey)
+	assert.Equal(t, "EventData", envelope.Data.BaseType)
+	assert.Equal(t, 2, envelope.Data.BaseData.Version)
+	assert.Equal(t, "azcopy.job.finished", envelope.Data.BaseData.Name)
+	assert.Len(t, envelope.Data.BaseData.Measurements, 50)
+	assert.Equal(t, float64(1), envelope.Data.BaseData.Measurements["azcopy.job.finished"])
+	assert.Equal(t, float64(1024), envelope.Data.BaseData.Measurements["azcopy.bytes_transferred"])
+	assert.Equal(t, float64(100), envelope.Data.BaseData.Measurements["azcopy.percent_complete"])
+	assert.Equal(t, "copy", envelope.Data.BaseData.Properties["Command"])
+	assert.Equal(t, "", envelope.Data.BaseData.Properties["SourceCloudType"])
+	assert.Equal(t, "public", envelope.Data.BaseData.Properties["DestCloudType"])
+	_, hasSourceEndpointIdentity := envelope.Data.BaseData.Properties["SourceEndpointIdentity"]
+	assert.False(t, hasSourceEndpointIdentity)
+	_, hasDestEndpointIdentity := envelope.Data.BaseData.Properties["DestEndpointIdentity"]
+	assert.False(t, hasDestEndpointIdentity)
+	_, hasCloudType := envelope.Data.BaseData.Properties["CloudType"]
+	assert.False(t, hasCloudType)
 }
 
 func TestReportEventAppInsights(t *testing.T) {
@@ -451,14 +535,12 @@ func TestReportEventAppInsights(t *testing.T) {
 
 	var envs []appInsightsEnvelope
 	require.NoError(t, json.Unmarshal(client.lastBody, &envs))
-	// One HTTP request batches one envelope per measurement. Application
-	// Insights only ingests the first metric when an envelope contains several.
-	require.Len(t, envs, 50)
-	for _, envelope := range envs {
-		assert.Len(t, envelope.Data.BaseData.Metrics, 1)
-	}
-	assert.Equal(t, "azcopy.job.finished", envs[0].Data.BaseData.Metrics[0].Name)
-	assert.Equal(t, "azcopy.percent_complete", envs[49].Data.BaseData.Metrics[0].Name)
+	require.Len(t, envs, 1)
+	assert.Equal(t, "Microsoft.ApplicationInsights.Event", envs[0].Name)
+	assert.Equal(t, "EventData", envs[0].Data.BaseType)
+	assert.Equal(t, "azcopy.job.finished", envs[0].Data.BaseData.Name)
+	assert.Len(t, envs[0].Data.BaseData.Measurements, 50)
+	assert.Equal(t, float64(100), envs[0].Data.BaseData.Measurements["azcopy.percent_complete"])
 }
 
 func TestReportEventAppInsightsServerError(t *testing.T) {
@@ -500,13 +582,43 @@ func TestReportEventOTel(t *testing.T) {
 
 	var envs []appInsightsEnvelope
 	require.NoError(t, json.Unmarshal(client.lastBody, &envs))
-	require.Len(t, envs, 50)
-	for _, envelope := range envs {
-		assert.Len(t, envelope.Data.BaseData.Metrics, 1)
-	}
-	assert.Equal(t, "azcopy.job.finished", envs[0].Data.BaseData.Metrics[0].Name)
-	assert.Equal(t, "azcopy.percent_complete", envs[49].Data.BaseData.Metrics[0].Name)
+	require.Len(t, envs, 1)
+	assert.Equal(t, "Microsoft.ApplicationInsights.Event", envs[0].Name)
+	assert.Equal(t, "EventData", envs[0].Data.BaseType)
+	assert.Equal(t, "azcopy.job.finished", envs[0].Data.BaseData.Name)
+	assert.Len(t, envs[0].Data.BaseData.Measurements, 50)
+	assert.Equal(t, float64(100), envs[0].Data.BaseData.Measurements["azcopy.percent_complete"])
 	assert.Equal(t, "copy", envs[0].Data.BaseData.Properties["Command"])
+}
+
+func TestReportEventBackendsBoundProperties(t *testing.T) {
+	for _, backend := range []Backend{BackendAppInsights, BackendOTel} {
+		t.Run(string(backend), func(t *testing.T) {
+			oversized := strings.Repeat("x", maxPropValueLen+100)
+			event := sampleFinished()
+			event.Resource.OSVersion = oversized
+			event.Dimensions.Options.Values = map[string]string{"OptFutureValue": oversized}
+			event.JobID = oversized
+
+			client := &stubClient{status: http.StatusOK}
+			reporter := NewReporter(Config{
+				Backend:          backend,
+				ConnectionString: testConnString,
+				HTTPClient:       client,
+			})
+			require.NoError(t, reporter.ReportEvent(context.Background(), event))
+
+			var envelopes []appInsightsEnvelope
+			require.NoError(t, json.Unmarshal(client.lastBody, &envelopes))
+			require.Len(t, envelopes, 1)
+			for name, value := range envelopes[0].Data.BaseData.Properties {
+				assert.LessOrEqual(t, len(value), propertyValueLimit(name), name)
+			}
+			assert.Len(t, envelopes[0].Data.BaseData.Properties["OSVersion"], maxHostValueLen)
+			assert.Len(t, envelopes[0].Data.BaseData.Properties["JobID"], maxIdentifierValueLen)
+			assert.Len(t, envelopes[0].Data.BaseData.Properties["OptFutureValue"], maxOptionValueLen)
+		})
+	}
 }
 
 func TestReportEvents_StopsOnFirstError(t *testing.T) {

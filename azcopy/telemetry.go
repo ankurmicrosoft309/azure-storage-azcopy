@@ -45,11 +45,12 @@ import (
 )
 
 const (
-	telemetrySchemaVersion  = "2"
-	telemetrySamplingRate   = 0.01
-	telemetrySamplingUnit   = "job_id"
-	telemetrySamplerVersion = "job-id-sha256-v1"
+	telemetrySchemaVersion       = "3"
+	defaultTelemetrySamplingRate = 0.01
+	telemetrySamplerVersion      = "job-id-sha256-v1"
 )
+
+var telemetrySamplingRate = defaultTelemetrySamplingRate
 
 // telemetryConnectionString is injected into official binaries at build time.
 // It remains empty for local builds, which fail closed with telemetry disabled.
@@ -144,7 +145,7 @@ func (a *telemetryAgent) reportStarted(dims telemetry.JobDimensions, runID, invo
 	evt := telemetry.JobStartedEvent{
 		Resource:     a.resource,
 		Dimensions:   dims,
-		RunID:        runID,
+		JobID:        runID,
 		InvocationID: invocationID,
 		Timestamp:    start,
 		StartedCount: 1,
@@ -156,7 +157,7 @@ func (a *telemetryAgent) reportStarted(dims telemetry.JobDimensions, runID, invo
 // telemetrySendTimeout) so the event is delivered before the process exits.
 // Failures are logged to the job log only.
 func (a *telemetryAgent) reportFinished(evt telemetry.JobFinishedEvent) {
-	if a == nil || !a.enabled || !shouldSampleTelemetry(evt.RunID, telemetrySamplingRate) {
+	if a == nil || !a.enabled || !shouldSampleTelemetry(evt.JobID, telemetrySamplingRate) {
 		return
 	}
 	a.sendSafely(evt)
@@ -241,7 +242,6 @@ func (f *attemptTelemetryFinalizer) finish(attemptErr error) {
 		resource = f.agent.resource
 	}
 	event := buildFinishedEvent(resource, f.dimensions, f.runID, f.invocationID, f.start, time.Now(), summary, time.Since(f.start), enumerationElapsed, transferElapsed, shape)
-	event.TerminalReason = terminalReason
 	event.TerminalStage = terminalStage
 	event.JobErrorCategory, event.JobErrorCode = jobErrorAttributes(attemptErr, terminalReason, terminalStage)
 	f.agent.reportFinished(event)
@@ -385,7 +385,7 @@ func (a *telemetryAgent) reportCommand(command, runID, invocationID string, opti
 		Resource:     a.resource,
 		Command:      command,
 		Options:      options.Clone(),
-		RunID:        runID,
+		JobID:        runID,
 		InvocationID: invocationID,
 		Timestamp:    time.Now(),
 		InvokedCount: 1,
@@ -437,28 +437,21 @@ func buildResourceAttributes() telemetry.ResourceAttributes {
 	imds := probeIMDS()
 
 	return telemetry.ResourceAttributes{
-		ServiceName:           "azcopy",
-		ServiceVersion:        common.AzcopyVersion,
-		SchemaVersion:         telemetrySchemaVersion,
-		SamplingRate:          telemetrySamplingRate,
-		SamplingUnit:          telemetrySamplingUnit,
-		SamplerVersion:        telemetrySamplerVersion,
-		OSType:                runtime.GOOS,
-		OSVersion:             hw.osVersion,
-		HostArch:              runtime.GOARCH,
-		HostNumCPU:            runtime.NumCPU(),
-		HostCPUModel:          hw.cpuModel,
-		HostMemoryTotalGB:     hw.memoryTotalGB,
-		HostNICSpeedMbps:      hw.nicMbps,
-		HostNICSpeedAvailable: hw.nicMbps >= 0,
-		HostNICSpeedBucket:    nicSpeedBucket(hw.nicMbps),
-		HostVirtualization:    virtualization(imds.isAzureVM),
-		GeoRegion:             imds.region,
-		GeoTimezone:           geoTimezone(),
-		GeoCountry:            geoCountry(),
-		NetworkRunContext:     networkRunContext(imds.isAzureVM),
-		InstallationID:        installationID(),
-		InvocationContext:     detectInvocationContext(os.Getenv),
+		AzCopyVersion:      common.AzcopyVersion,
+		SchemaVersion:      telemetrySchemaVersion,
+		SamplingRate:       telemetrySamplingRate,
+		SamplerVersion:     telemetrySamplerVersion,
+		OSType:             runtime.GOOS,
+		OSVersion:          hw.osVersion,
+		HostArch:           runtime.GOARCH,
+		HostNumCPU:         runtime.NumCPU(),
+		HostCPUModel:       hw.cpuModel,
+		HostMemoryTotalGB:  hw.memoryTotalGB,
+		HostNICSpeedMbps:   hw.nicMbps,
+		HostNICSpeedBucket: nicSpeedBucket(hw.nicMbps),
+		AzureVMDetected:    imds.isAzureVM,
+		InstallationID:     installationID(),
+		InvocationContext:  detectInvocationContext(os.Getenv),
 	}
 }
 
@@ -475,24 +468,6 @@ func nicSpeedBucket(speedMbps int) string {
 	default:
 		return ">=40gbps"
 	}
-}
-
-// virtualization maps the Azure-VM detection signal to the HostVirtualization
-// attribute value.
-func virtualization(isAzureVM bool) string {
-	if isAzureVM {
-		return "azure-vm"
-	}
-	return "unknown"
-}
-
-// networkRunContext maps the Azure-VM detection signal to the NetworkRunContext
-// attribute value.
-func networkRunContext(isAzureVM bool) string {
-	if isAzureVM {
-		return "azure-vm"
-	}
-	return "on-prem"
 }
 
 // installationID returns a stable, anonymous per-install identifier. It is a
@@ -535,13 +510,9 @@ func detectInvocationContext(getenv func(string) string) string {
 func baseJobDimensions(command string, fromTo common.FromTo, srcCredType, dstCredType common.CredentialType) telemetry.JobDimensions {
 	return telemetry.JobDimensions{
 		Command:             command,
-		AttemptType:         "original",
-		MeasurementScope:    "attempt",
 		FromTo:              fromTo.String(),
 		SourceType:          fromTo.From().String(),
 		DestType:            fromTo.To().String(),
-		TransferDirection:   transferDirection(fromTo),
-		TransferTopology:    transferTopology(fromTo),
 		SourceProtocol:      protocolForLocation(fromTo.From()),
 		SourceMountType:     mountTypeForLocation(fromTo.From()),
 		DestProtocol:        protocolForLocation(fromTo.To()),
@@ -552,21 +523,17 @@ func baseJobDimensions(command string, fromTo common.FromTo, srcCredType, dstCre
 
 func resumeJobDimensions(jobDetails common.GetJobDetailsResponse, source, destination common.ResourceString, srcCredType, dstCredType common.CredentialType, options telemetry.OptionAttributes) telemetry.JobDimensions {
 	d := baseJobDimensions("jobs.resume", jobDetails.FromTo, srcCredType, dstCredType)
-	d.AttemptType = "resume"
-	d.MeasurementScope = "job-cumulative"
+	d.SummaryCounterScope = "job-cumulative"
 	d.SourceMountType = sourceMountType(jobDetails.FromTo.From(), source.Value)
 	d.SourceStorageAccount = storageAccountName(source, jobDetails.FromTo.From())
-	d.SourceEndpointIdentity = sanitizedEndpointIdentity(source, jobDetails.FromTo.From())
 	d.SourceScope = scopeForLocation(source, jobDetails.FromTo.From(), true)
 	d.DestStorageAccount = storageAccountName(destination, jobDetails.FromTo.To())
-	d.DestEndpointIdentity = sanitizedEndpointIdentity(destination, jobDetails.FromTo.To())
 	d.DestScope = scopeForLocation(destination, jobDetails.FromTo.To(), false)
 	d.SourceAuthMechanism = authMechanism(srcCredType, source, jobDetails.FromTo.From())
 	d.DestAuthMechanism = authMechanism(dstCredType, destination, jobDetails.FromTo.To())
 	d.DestEndpointKind = endpointKind(destination, jobDetails.FromTo.To())
 	d.SourceCloudType = endpointCloudType(source, jobDetails.FromTo.From())
 	d.DestCloudType = endpointCloudType(destination, jobDetails.FromTo.To())
-	d.CloudType = cloudType(source, jobDetails.FromTo.From(), destination, jobDetails.FromTo.To())
 	d.Options = options.Clone()
 	return d
 }
@@ -623,75 +590,19 @@ func sourceMountType(loc common.Location, localPath string) string {
 	return "local-disk"
 }
 
-// transferTopology summarizes the source->destination shape of the transfer.
-// The on-prem vs. azure-vm aspect of *where AzCopy runs* is captured separately
-// by the NetworkRunContext resource attribute.
-func transferTopology(fromTo common.FromTo) string {
-	switch {
-	case fromTo.From() == common.ELocation.S3() && fromTo.To().IsAzure():
-		return "aws-to-azure"
-	case fromTo.From() == common.ELocation.GCP() && fromTo.To().IsAzure():
-		return "gcs-to-azure"
-	case fromTo.From().IsAzure() && fromTo.To().IsAzure():
-		return "intra-azure"
-	case fromTo.IsS2S():
-		return "cross-cloud"
-	case fromTo.IsUpload():
-		return "local-to-azure"
-	case fromTo.IsDownload():
-		return "azure-to-local"
-	case fromTo.IsDelete():
-		return "azure-delete"
-	default:
-		return "unknown"
-	}
-}
-
-func transferDirection(fromTo common.FromTo) string {
-	switch {
-	case fromTo.IsUpload():
-		return "upload"
-	case fromTo.IsDownload():
-		return "download"
-	case fromTo.IsS2S():
-		return "s2s"
-	case fromTo.IsDelete():
-		return "delete"
-	default:
-		return "unknown"
-	}
-}
-
-// storageAccountName returns a customer-identifying remote resource name: the
-// Azure storage account name (the first DNS label of the host) for Azure
-// resources, e.g. "myaccount" from "https://myaccount.blob.core.windows.net/c",
-// or the bucket name for S3/GCP resources. It returns "" for local resources or
-// when the value cannot be parsed. Account/bucket names are globally unique and
-// DNS-constrained, so no hashing is applied.
+// storageAccountName returns the Azure storage account name (the first DNS
+// label of the host) for recognized Azure Storage endpoints. It returns "" for
+// non-Azure resources, custom endpoints, and values that cannot be parsed.
 func storageAccountName(r common.ResourceString, loc common.Location) string {
-	if loc.IsAzure() {
-		host := hostOf(r)
-		if host == "" || !isRecognizedAzureStorageHost(host) {
-			return ""
-		}
-		if i := strings.IndexByte(host, '.'); i > 0 {
-			return host[:i]
-		}
+	if !loc.IsAzure() {
 		return ""
 	}
-	switch loc {
-	case common.ELocation.S3():
-		if u, err := url.Parse(r.Value); err == nil {
-			if p, err := common.NewS3URLParts(*u); err == nil {
-				return p.BucketName
-			}
-		}
-	case common.ELocation.GCP():
-		if u, err := url.Parse(r.Value); err == nil {
-			if p, err := common.NewGCPURLParts(*u); err == nil {
-				return p.BucketName
-			}
-		}
+	host := hostOf(r)
+	if host == "" || !isRecognizedAzureStorageHost(host) {
+		return ""
+	}
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		return host[:i]
 	}
 	return ""
 }
@@ -709,23 +620,6 @@ func isRecognizedAzureStorageHost(host string) bool {
 		}
 	}
 	return false
-}
-
-func sanitizedEndpointIdentity(r common.ResourceString, loc common.Location) string {
-	if !loc.IsRemote() || storageAccountName(r, loc) != "" {
-		return ""
-	}
-	u, err := url.Parse(r.Value)
-	if err != nil || u.Scheme == "" || u.Hostname() == "" {
-		return ""
-	}
-	scheme := strings.ToLower(u.Scheme)
-	host := strings.ToLower(u.Hostname())
-	port := u.Port()
-	if port != "" && !((scheme == "https" && port == "443") || (scheme == "http" && port == "80")) {
-		host = host + ":" + port
-	}
-	return scheme + "://" + host
 }
 
 func authMechanism(credType common.CredentialType, resource common.ResourceString, location common.Location) string {
@@ -813,19 +707,7 @@ func endpointCloudType(resource common.ResourceString, location common.Location)
 	if cloud := cloudTypeFromHost(hostOf(resource)); cloud != "" {
 		return cloud
 	}
-	return "public"
-}
-
-// cloudType preserves the legacy combined Azure cloud dimension. New queries
-// should use SourceCloudType and DestCloudType so endpoint roles stay distinct.
-func cloudType(src common.ResourceString, srcLoc common.Location, dst common.ResourceString, dstLoc common.Location) string {
-	if cloud := endpointCloudType(src, srcLoc); cloud != "" {
-		return cloud
-	}
-	if cloud := endpointCloudType(dst, dstLoc); cloud != "" {
-		return cloud
-	}
-	return ""
+	return "unknown"
 }
 
 // cloudTypeFromHost maps an Azure storage host suffix to a cloud environment.
@@ -850,17 +732,14 @@ func copyJobDimensions(o *CookedTransferOptions, srcCredType, dstCredType common
 	d := baseJobDimensions("copy", o.fromTo, srcCredType, dstCredType)
 	d.SourceMountType = sourceMountType(o.fromTo.From(), o.source.Value)
 	d.SourceStorageAccount = storageAccountName(o.source, o.fromTo.From())
-	d.SourceEndpointIdentity = sanitizedEndpointIdentity(o.source, o.fromTo.From())
 	d.SourceScope = scopeForLocation(o.source, o.fromTo.From(), true)
 	d.DestStorageAccount = storageAccountName(o.destination, o.fromTo.To())
-	d.DestEndpointIdentity = sanitizedEndpointIdentity(o.destination, o.fromTo.To())
 	d.DestScope = scopeForLocation(o.destination, o.fromTo.To(), false)
 	d.SourceAuthMechanism = authMechanism(srcCredType, o.source, o.fromTo.From())
 	d.DestAuthMechanism = authMechanism(dstCredType, o.destination, o.fromTo.To())
 	d.DestEndpointKind = endpointKind(o.destination, o.fromTo.To())
 	d.SourceCloudType = endpointCloudType(o.source, o.fromTo.From())
 	d.DestCloudType = endpointCloudType(o.destination, o.fromTo.To())
-	d.CloudType = cloudType(o.source, o.fromTo.From(), o.destination, o.fromTo.To())
 	d.Options = o.telemetryOptions.Clone()
 	if o.benchmarkTelemetry != nil {
 		d.Command = "bench"
@@ -882,17 +761,14 @@ func syncJobDimensions(o *cookedSyncOptions, srcCredType, dstCredType common.Cre
 	d := baseJobDimensions("sync", o.fromTo, srcCredType, dstCredType)
 	d.SourceMountType = sourceMountType(o.fromTo.From(), o.source.Value)
 	d.SourceStorageAccount = storageAccountName(o.source, o.fromTo.From())
-	d.SourceEndpointIdentity = sanitizedEndpointIdentity(o.source, o.fromTo.From())
 	d.SourceScope = scopeForLocation(o.source, o.fromTo.From(), true)
 	d.DestStorageAccount = storageAccountName(o.destination, o.fromTo.To())
-	d.DestEndpointIdentity = sanitizedEndpointIdentity(o.destination, o.fromTo.To())
 	d.DestScope = scopeForLocation(o.destination, o.fromTo.To(), false)
 	d.SourceAuthMechanism = authMechanism(srcCredType, o.source, o.fromTo.From())
 	d.DestAuthMechanism = authMechanism(dstCredType, o.destination, o.fromTo.To())
 	d.DestEndpointKind = endpointKind(o.destination, o.fromTo.To())
 	d.SourceCloudType = endpointCloudType(o.source, o.fromTo.From())
 	d.DestCloudType = endpointCloudType(o.destination, o.fromTo.To())
-	d.CloudType = cloudType(o.source, o.fromTo.From(), o.destination, o.fromTo.To())
 	d.Options = o.telemetryOptions.Clone()
 	return d
 }
@@ -906,11 +782,11 @@ func buildFinishedEvent(resource telemetry.ResourceAttributes, dims telemetry.Jo
 	enumerationPhaseDurationSeconds := enumerationElapsed.Seconds()
 	transferPhaseDurationSeconds := transferElapsed.Seconds()
 	failureErrorCodes, failureErrorOtherCount := aggregateErrorCodesWithOther(summary.FailedTransfers)
-	performanceConstraint, primaryAdviceCode, adviceCodes := performanceAdviceAttributes(summary.PerfConstraint, summary.PerformanceAdvice)
+	performanceConstraint, adviceCodes := performanceAdviceAttributes(summary.PerfConstraint, summary.PerformanceAdvice)
 	return telemetry.JobFinishedEvent{
 		Resource:                        resource,
 		Dimensions:                      dims,
-		RunID:                           runID,
+		JobID:                           runID,
 		InvocationID:                    invocationID,
 		StartTimestamp:                  start,
 		EndTimestamp:                    end,
@@ -967,7 +843,6 @@ func buildFinishedEvent(resource telemetry.ResourceAttributes, dims telemetry.Jo
 		FailureErrorCodes:               failureErrorCodes,
 		FailureErrorOtherCount:          failureErrorOtherCount,
 		PerformanceConstraint:           performanceConstraint,
-		PrimaryPerformanceAdviceCode:    primaryAdviceCode,
 		PerformanceAdviceCodes:          adviceCodes,
 	}
 }
@@ -1030,7 +905,7 @@ func aggregateErrorCodesWithOther(failed []common.TransferDetail) (string, int64
 
 const maxPerformanceAdviceCodes = 8
 
-func performanceAdviceAttributes(constraint common.PerfConstraint, advice []common.PerformanceAdvice) (string, string, []string) {
+func performanceAdviceAttributes(constraint common.PerfConstraint, advice []common.PerformanceAdvice) (string, []string) {
 	constraintValue := ""
 	if constraint != common.EPerfConstraint.Unknown() {
 		constraintValue = constraint.String()
@@ -1038,14 +913,10 @@ func performanceAdviceAttributes(constraint common.PerfConstraint, advice []comm
 
 	seen := make(map[string]struct{})
 	codes := make([]string, 0, len(advice))
-	primary := ""
 	for _, item := range advice {
 		code := sanitizeAdviceCode(item.Code)
 		if code == "" {
 			continue
-		}
-		if item.PriorityAdvice && primary == "" {
-			primary = code
 		}
 		if _, exists := seen[code]; exists || len(codes) == maxPerformanceAdviceCodes {
 			continue
@@ -1053,7 +924,7 @@ func performanceAdviceAttributes(constraint common.PerfConstraint, advice []comm
 		seen[code] = struct{}{}
 		codes = append(codes, code)
 	}
-	return constraintValue, primary, codes
+	return constraintValue, codes
 }
 
 func sanitizeAdviceCode(code string) string {

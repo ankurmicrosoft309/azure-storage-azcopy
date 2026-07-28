@@ -41,7 +41,7 @@ https://ade.applicationinsights.io/subscriptions/31347be8-d066-464e-9866-7e58d85
 
 Database: `sharankur_insights1`
 
-Table: `customMetrics`
+Table: `customEvents` (numeric `customMeasurements` are expanded into a virtual metric name/value shape by each query)
 
 For cross-service queries initiated from a native ADX cluster, use `https://adx.monitor.azure.com/...` as shown in `queries/server/04_client_server_account_hour.kql`.
 
@@ -132,6 +132,68 @@ Add one free-text parameter:
 | Requests per estimated job by account/hour | `queries/server/04_client_server_account_hour.kql` | XStoreUserAgent | Table or time chart |
 
 The account/hour correlation is not a job-to-request join. It correlates client jobs and server requests by normalized destination account and hour.
+
+## Panel Descriptions
+
+### Overview KPIs
+
+Summarizes the selected time range with observed sampled job attempts, sampling-adjusted estimated attempts and transferred TB, estimated successful completion rate, and starts with no matching finish event. Estimated values weight each finished attempt by `1 / SamplingRate`; unmatched starts remain an observed telemetry-quality count.
+
+### Volume by topology
+
+Shows daily sampling-adjusted job attempts and transferred TB for each transfer topology, such as local-to-Azure, Azure-to-local, intra-Azure, AWS-to-Azure, and GCS-to-Azure. Only finished attempts contribute; missing topology values appear as `unknown`.
+
+### Outcomes by command
+
+Breaks job outcomes down by command (`copy`, `sync`, `bench`, or other values) and terminal status, including completed, completed with skipped items, completed with errors, failed, and cancelled. It shows both observed sampled attempts and inverse-sampling estimated attempts.
+
+### Weekly command and version trend
+
+Shows estimated weekly command usage by AzCopy version. It combines finished job-producing commands with standalone `command.invoked` telemetry, then applies each event's inverse sampling weight. Use it to track command and version adoption over time rather than transfer performance.
+
+### Performance percentiles
+
+Reports sampled-job performance by transfer topology: average and P50/P90/P95 job throughput, P90/P95 completion hours per TB, and average enumeration and transfer-phase durations. Percentiles are calculated directly over observed sampled jobs and are not inverse-sampling weighted; `SampleSize` indicates the population behind each row. Jobs with no transferred bytes or nonpositive duration are excluded.
+
+### Platform and version mix
+
+Ranks the top 30 combinations of source type, destination type, transfer topology, host operating system, and AzCopy version. `ObservedAttempts` is the sampled count and `EstimatedAttempts` applies inverse sampling. This is a multidimensional usage mix, so totals across overlapping filtered views should not be treated as distinct customers.
+
+### Reliability rates
+
+Shows sampling-adjusted completion, partial-success, failure, cancellation, failed-object, server-busy, network-error, and resume-success rates. Job outcome rates use estimated job attempts; failed-object rate uses scheduled objects; server-busy and network-error rates use Storage HTTP attempts. These percentages have different denominators and are not intended to add to 100%.
+
+### Top job errors
+
+Ranks the top 20 terminal job error category/code combinations by estimated attempts and includes observed attempt counts plus example bounded failed-transfer code histograms. It describes why jobs ended unsuccessfully or with errors; it is not a count of individual HTTP failures or failed files.
+
+### Telemetry quality
+
+Counts structural telemetry issues without extrapolating them: starts without finishes, finishes without starts, incomplete schema-v2 finish metric sets, and missing sampling rates. It also reports observed schema versions. Use this panel to assess whether the business panels have a trustworthy input population.
+
+### Observed job attempts
+
+Lists up to the 200 most recent sampled finished attempts, including IDs, command, status, topology, source and destination Azure storage accounts, version, bytes, duration, throughput, failed objects, and inverse-sampling weight. The optional storage-account parameter matches either Azure endpoint. Rows are observed records; `EstimatedWeight` is context, not a duplicated estimated row count.
+
+### Top source and destination movers
+
+Ranks up to 50 Azure storage accounts by sampling-adjusted transferred TB, keeping source and destination roles separate. S3/GCS bucket names are never included. It also shows observed and estimated attempts. An Azure service-to-service job contributes once to its source account and once to its destination account, so source and destination rows must not be summed to derive a global volume total.
+
+### Account ownership
+
+Shows the latest available server-side metadata for storage accounts: subscription, billed subscription, resource group, Storage logical tenant, live status, and snapshot time. The data comes from `XStoreAccountPropertiesDaily`, is not client-sampled, and uses a three-day lookback to locate the latest snapshot. Storage logical tenant is not the customer's Microsoft Entra tenant ID.
+
+### Server-observed AzCopy requests
+
+Shows five-minute Azure Storage request counts where the server-observed user agent identifies AzCopy, broken down by AzCopy tool version and Storage SDK/version. These are server-side observed requests rather than estimated client jobs. The optional account parameter filters the server account name.
+
+### Storage API operation mix
+
+Ranks the top 30 hourly Storage service, request-type, and authentication-type combinations, including total requests, successes, throttles, authorization errors, network errors, and ingress/egress bytes. This server-side account traffic is not client-sampled, but it can include non-AzCopy callers because the source table is account transaction telemetry rather than an exact AzCopy request join.
+
+### Requests per estimated job
+
+Correlates destination-account/hour client telemetry with server-observed AzCopy request counts. It shows observed jobs, inverse-sampling estimated jobs, requests, and requests per estimated job. This is an aggregate account/time correlation, not exact attribution of requests to a JobID; a full outer join intentionally exposes hours present on only one side.
 
 ## Interpretation Rules
 

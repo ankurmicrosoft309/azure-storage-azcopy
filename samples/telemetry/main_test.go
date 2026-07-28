@@ -21,22 +21,23 @@ func TestBuildSampleEvents(t *testing.T) {
 		"copy": {},
 		"sync": {},
 	}
+	fromToCounts := make(map[string]int)
 	commandEvents := 0
 	for _, event := range events {
 		switch typed := event.(type) {
 		case aztelemetry.CommandInvokedEvent:
 			commandEvents++
 			assert.Equal(t, "jobs.list", typed.Command)
-			assert.NotEmpty(t, typed.RunID)
+			assert.NotEmpty(t, typed.JobID)
 			assert.NotEmpty(t, typed.InvocationID)
 		case aztelemetry.JobStartedEvent:
 			counts[typed.Dimensions.Command]["started"]++
+			fromToCounts[typed.Dimensions.FromTo]++
+			assert.False(t, typed.Resource.AzureVMDetected)
 			assert.Equal(t, "telemetry-sample-v1", typed.Resource.SamplerVersion)
-			assert.Equal(t, "2", typed.Resource.SchemaVersion)
+			assert.Equal(t, "3", typed.Resource.SchemaVersion)
 			assert.Equal(t, 1.0, typed.Resource.SamplingRate)
-			assert.Empty(t, typed.Dimensions.SourceCloudType)
-			assert.Equal(t, "public", typed.Dimensions.DestCloudType)
-			assert.NotEmpty(t, typed.RunID)
+			assert.NotEmpty(t, typed.JobID)
 			assert.NotEmpty(t, typed.InvocationID)
 		case aztelemetry.JobFinishedEvent:
 			counts[typed.Dimensions.Command]["finished"]++
@@ -44,13 +45,48 @@ func TestBuildSampleEvents(t *testing.T) {
 			assert.Positive(t, typed.ObjectsScheduled)
 			assert.Positive(t, typed.StorageHTTPAttemptCount)
 			assert.Positive(t, typed.JobDurationSeconds)
-			assert.NotEmpty(t, typed.TerminalReason)
-			assert.GreaterOrEqual(t, typed.BytesOverWire, typed.BytesTransferred)
+			assert.NotEmpty(t, typed.TerminalStage)
+			assert.LessOrEqual(t, typed.BytesTransferred, typed.BytesExpected)
+			assert.LessOrEqual(t, typed.BytesExpected, typed.BytesEnumerated)
+			assert.Greater(t, typed.BytesOverWire, typed.BytesTransferred)
+			assert.GreaterOrEqual(t, typed.SourceBytesScanned, typed.BytesEnumerated)
+			if typed.ObjectsCompleted == typed.ObjectsScheduled {
+				assert.Equal(t, typed.BytesEnumerated, typed.BytesExpected)
+				assert.Equal(t, typed.BytesEnumerated, typed.BytesTransferred)
+			} else {
+				assert.Equal(t, typed.BytesTransferred, typed.BytesExpected)
+			}
 			assert.Equal(t, typed.ObjectsScheduled, typed.RegularFilesScheduled+typed.SymlinksScheduled+typed.HardlinksConvertedScheduled)
 			assert.Equal(t, typed.ObjectsScheduled, typed.ObjectsCompleted+typed.ObjectsFailed+typed.ObjectsSkipped)
 			assert.Equal(t, typed.FolderPropertiesScheduled, typed.FolderPropertiesCompleted+typed.FolderPropertiesFailed+typed.FolderPropertiesSkipped)
+			assert.Equal(t, typed.ObjectsCompleted+typed.FolderPropertiesCompleted, typed.TransfersCompleted)
+			assert.Equal(t, typed.ObjectsFailed+typed.FolderPropertiesFailed, typed.TransfersFailed)
+			assert.Equal(t, typed.ObjectsSkipped+typed.FolderPropertiesSkipped, typed.TransfersSkipped)
+			assert.Equal(t, typed.ObjectsScheduled+typed.FolderPropertiesScheduled, typed.TransfersTotal)
 			assert.Equal(t, typed.TransfersTotal, typed.TransfersCompleted+typed.TransfersFailed+typed.TransfersSkipped)
 			assert.InDelta(t, 100*float64(typed.NetworkErrorAttemptCount)/float64(typed.StorageHTTPAttemptCount), typed.NetworkErrorPct, 0.0001)
+			assert.Equal(t, typed.ServerBusyThroughputCount+typed.ServerBusyIOPSCount+typed.ServerBusyOtherCount, typed.ServerBusy503Count)
+			assert.InDelta(t, 100*float64(typed.ServerBusy503Count)/float64(typed.StorageHTTPAttemptCount), typed.ServerBusyPct, 0.0001)
+			assert.InDelta(t, float64(typed.BytesTransferred)*8/1_000_000/typed.JobDurationSeconds, typed.JobThroughputMbps, 0.0001)
+			assert.InDelta(t, float64(typed.BytesTransferred)*8/1_000_000/typed.TransferPhaseDurationSeconds, typed.TransferPhaseThroughputMbps, 0.0001)
+			switch typed.Dimensions.SourceType {
+			case "Local":
+				assert.Zero(t, typed.ContainersScanned)
+				assert.Zero(t, typed.ContainersTouched)
+				assert.Zero(t, typed.BucketsScanned)
+				assert.Zero(t, typed.BucketsTouched)
+			case "Blob", "BlobFS", "File":
+				assert.Positive(t, typed.ContainersScanned)
+				assert.Positive(t, typed.ContainersTouched)
+				assert.LessOrEqual(t, typed.ContainersTouched, typed.ContainersScanned)
+				assert.Zero(t, typed.BucketsScanned)
+				assert.Zero(t, typed.BucketsTouched)
+			case "S3", "GCP":
+				assert.Zero(t, typed.ContainersScanned)
+				assert.Zero(t, typed.ContainersTouched)
+				assert.Equal(t, int64(1), typed.BucketsScanned)
+				assert.Equal(t, int64(1), typed.BucketsTouched)
+			}
 		default:
 			t.Fatalf("unexpected event type %T", event)
 		}
@@ -61,6 +97,33 @@ func TestBuildSampleEvents(t *testing.T) {
 	assert.Equal(t, jobsPerCommand, counts["copy"]["finished"])
 	assert.Equal(t, jobsPerCommand, counts["sync"]["started"])
 	assert.Equal(t, jobsPerCommand, counts["sync"]["finished"])
+	assert.Equal(t, map[string]int{"LocalBlob": 2, "BlobLocal": 2, "BlobBlob": 2, "S3Blob": 2, "GCPBlob": 2}, fromToCounts)
+}
+
+func TestSampleDimensionVariants(t *testing.T) {
+	tests := []struct {
+		index         int
+		fromTo        string
+		sourceCloud   string
+		destCloud     string
+		sourceAccount string
+	}{
+		{0, "LocalBlob", "", "public", ""},
+		{1, "BlobLocal", "public", "", "azcopytelemetrysource"},
+		{2, "BlobBlob", "public", "public", "azcopytelemetrysource"},
+		{3, "S3Blob", "", "public", ""},
+		{4, "GCPBlob", "", "gov", ""},
+	}
+
+	for _, test := range tests {
+		dimensions := sampleDimensions("copy", test.index)
+		assert.Equal(t, test.fromTo, dimensions.FromTo)
+		assert.Equal(t, test.sourceCloud, dimensions.SourceCloudType)
+		assert.Equal(t, test.destCloud, dimensions.DestCloudType)
+		assert.Equal(t, test.sourceAccount, dimensions.SourceStorageAccount)
+		assert.NotEmpty(t, dimensions.SourceProtocol)
+		assert.NotEmpty(t, dimensions.DestProtocol)
+	}
 }
 
 func TestBuildSampleEventsVariesByRun(t *testing.T) {
@@ -81,10 +144,10 @@ func TestPairedEventsShareCorrelationIDs(t *testing.T) {
 	for _, event := range events {
 		switch typed := event.(type) {
 		case aztelemetry.JobStartedEvent:
-			started[typed.RunID] = typed.InvocationID
+			started[typed.JobID] = typed.InvocationID
 		case aztelemetry.JobFinishedEvent:
-			require.Contains(t, started, typed.RunID)
-			assert.Equal(t, started[typed.RunID], typed.InvocationID)
+			require.Contains(t, started, typed.JobID)
+			assert.Equal(t, started[typed.JobID], typed.InvocationID)
 			assert.Equal(t, typed.StartTimestamp, typed.EndTimestamp.Add(-time.Duration(typed.JobDurationSeconds)*time.Second))
 		}
 	}
@@ -108,10 +171,18 @@ func TestWritePayloadSamples(t *testing.T) {
 		assert.Contains(t, markdown, section)
 	}
 	assert.Equal(t, 5, strings.Count(markdown, "```json"))
-	// Command/start events each have one measurement; finish events each have 50.
-	assert.Equal(t, 103, strings.Count(markdown, "\"name\": \"Microsoft.ApplicationInsights.Metric\""))
+	assert.Equal(t, 5, strings.Count(markdown, "\"name\": \"Microsoft.ApplicationInsights.Event\""))
 	assert.Equal(t, 2, strings.Count(markdown, "\"name\": \"azcopy.job.finished\""))
-	assert.Contains(t, markdown, "\"name\": \"azcopy.bytes_transferred\"")
+	assert.Contains(t, markdown, "\"azcopy.bytes_transferred\":")
+	assert.Contains(t, markdown, "\"measurements\": {")
+	assert.Contains(t, markdown, "\"AzureVMDetected\": \"false\"")
+	for _, removed := range []string{
+		"AttemptType", "HostVirtualization", "MeasurementScope", "NetworkRunContext",
+		"PrimaryPerformanceAdviceCode", "RunID", "SamplingUnit", "TerminalReason", "TransferDirection", "TransferTopology",
+	} {
+		assert.NotContains(t, markdown, removed)
+	}
+	assert.Contains(t, markdown, "\"JobID\":")
 	assert.NotContains(t, markdown, "IngestionEndpoint")
 	assert.NotContains(t, markdown, "LiveEndpoint")
 	assert.NotContains(t, markdown, "ApplicationId")

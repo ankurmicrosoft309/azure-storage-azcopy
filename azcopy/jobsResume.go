@@ -203,6 +203,7 @@ func (c *Client) ResumeJob(ctx context.Context, jobID common.JobID, opts ResumeJ
 	}
 	telemetryFinalizer.setStage("completion")
 	telemetryFinalizer.setFinalSummary(finalSummary)
+	telemetryFinalizer.finish(nil)
 
 	if opts.Handler != nil {
 		opts.Handler.OnComplete(result)

@@ -15,8 +15,8 @@ The current branch already emits basic host, endpoint, option, volume, outcome, 
 1. Copy/sync/benchmark/resume attempts emit paired events only after options, endpoint dimensions, and enumerators are initialized. Observable failures after that point and explicit cancellation receive terminal events; earlier validation/initialization failures and hard process termination remain outside the paired lifecycle.
 2. Main benchmark jobs now use paired attempt events with `Command=bench`, effective benchmark inputs, generic terminal results, and performance diagnostics. Automatic cleanup jobs are excluded.
 3. Source transfer shape, enumeration/transfer duration, and resume outcomes are emitted. Finalization duration and comprehensive retry metrics remain absent.
-4. Decision #3 limits the client payload to storage account name or sanitized endpoint URL identity. AzCopy does not send tenant ID or subscription ID. The proposed trusted-backend mapping from Azure storage account name to subscription and tenant is not implemented in this repository, so subscription/tenant reporting is not currently end-to-end available.
-5. Geography means the geography of the host running AzCopy, not the storage account's region. Account/endpoint identity, geography, and host attributes still require privacy review and access controls.
+4. Decision #3 limits the client payload to normalized Azure storage account names. AzCopy does not send S3/GCS bucket names, endpoint hostnames, tenant ID, or subscription ID. The proposed trusted-backend mapping from Azure storage account name to subscription and tenant is not implemented in this repository, so subscription/tenant reporting is not currently end-to-end available.
+5. Geography is derived by Application Insights from the telemetry sender IP during ingestion; it is not emitted by AzCopy and is not the storage account's region. Account identity, derived geography, and host attributes still require privacy review and access controls.
 6. Deterministic 1% `JobID` sampling is implemented with schema/rate/unit/sampler metadata. It is suitable for population estimates but cannot support exact per-customer histories or adoption funnels.
 7. Supportability outcomes depend on support systems and user journeys outside the AzCopy process. Client telemetry alone cannot determine them.
 8. Local builds fail closed with no embedded connection string. E2E and official artifact templates inject separate Test/Prod secure variables; pipeline owners must populate those variables and verify ingestion before release.
@@ -47,7 +47,7 @@ The current branch already emits basic host, endpoint, option, volume, outcome, 
 | Exact customer history and funnels | The 1% deterministic `JobID` sample does not retain all jobs for an account/subscription, so exact recency, first-job, second-job, and time-to-first-success metrics cannot be reconstructed. |
 | Benchmark description text | Result status, stable advice codes, and diagnostics are emitted, but the requested human-readable description is intentionally excluded. |
 
-The recommended release scope is population-level, account/endpoint-level, and server-enriched subscription/tenant-level usage, performance, and reliability reporting. For the business assessment, “per customer” is operationalized as **per subscription**, with optional tenant-level rollups. Longitudinal funnels remain limited by `JobID` sampling, and supportability reporting still requires external joins.
+The recommended release scope is population-level, account-level, and server-enriched subscription/tenant-level usage, performance, and reliability reporting. For the business assessment, “per customer” is operationalized as **per subscription**, with optional tenant-level rollups. Longitudinal funnels remain limited by `JobID` sampling, and supportability reporting still requires external joins.
 
 ## Assessment Legend
 
@@ -71,46 +71,44 @@ These decisions affect several metrics and should be closed before the schema is
 - **Decision: the canonical unit of observation is a job attempt.** The original invocation is one attempt, and each resume invocation is a new attempt. Failed validation/enumeration, explicit cancellation, and other observable terminal failures are attempts even when no transfer is completed.
 - **`InvocationID`:** a new unique identifier generated for each attempt. The attempt's start and finish events carry the same `InvocationID`.
 - **`JobID`:** the existing AzCopy job identifier. The original attempt and every resumed attempt carry the same `JobID`, allowing attempts for one resumable job to be correlated without merging their measurements.
-- **`AttemptType`:** `original` or `resume`. This avoids inferring an attempt's role from command names or event ordering.
 - **Logical job:** an analytical grouping of attempts with the same `JobID`, not the emitted unit of observation.
 - **Transfer:** a scheduled file/object transfer. Folder-property transfers should not be counted as files.
 - **Dataset shape:** all source objects scanned, or only objects selected and scheduled. For sync these are materially different.
-- **Account/endpoint identity:** the normalized storage account name or sanitized endpoint URL identity allowed in the client payload by Decision #3. It is not itself a customer, subscription, tenant, or organization identifier, but the backend can resolve an Azure storage account name to subscription and tenant IDs.
+- **Account identity:** the normalized Azure storage account name allowed in the client payload by Decision #3. It is not itself a customer, subscription, tenant, or organization identifier, but the backend can resolve it to subscription and tenant IDs.
 
-Every attempt should emit exactly one start event and, when the process remains able to report, exactly one terminal finish event. Attempt-level counters and durations must reset when a resume starts. Dashboards may group attempts by `JobID` for resume analysis, but must not add cumulative job-plan values across attempts unless the finish schema also provides attempt deltas.
+Every attempt should emit exactly one start event and, when the process remains able to report, exactly one terminal finish event. Durations reset when a resume starts, while job-plan summary counters remain cumulative and are marked with `SummaryCounterScope=job-cumulative`. Dashboards may group attempts by `JobID` for resume analysis but must not add cumulative summary counters across attempts.
 
-### Define the Sampling Unit
+### Define the Sampling Contract
 
-- **Decision #2: use `SamplingUnit=job_id` for job-attempt telemetry.**
+- **Decision #2: use JobID as the fixed sampling key for job-attempt telemetry.**
 - Compute one deterministic inclusion decision from the canonical `JobID` and `SamplerVersion`. Do not include `InvocationID`, attempt type, timestamps, or process-specific values in the sampling key.
 - Apply the same decision to the original attempt, every resumed attempt, and every start/finish event sharing that `JobID`. This preserves the complete observable resumption history for each included job.
 - Changing the configured sampling rate may change the inclusion threshold, but it must not change the stable hash assigned to a `JobID`. This supports controlled ramp-up from 1% to higher rates without reshuffling the existing cohort.
 - Job-ID sampling is appropriate for AzCopy-wide totals, distributions, and rates.
-- Deterministic cohort sampling by account/endpoint identity would be required for exact account-level history, first/second-job funnels, and recency. Decision #2 instead samples by `JobID`, so these longitudinal metrics remain estimates or out of scope.
+- Deterministic cohort sampling by account identity would be required for exact account-level history, first/second-job funnels, and recency. Decision #2 instead samples by `JobID`, so these longitudinal metrics remain estimates or out of scope.
 - Start and finish events for one attempt must share that decision.
-- Every emitted event must include the effective `SamplingRate`, `SamplingUnit=job_id`, `SamplerVersion`, and `SchemaVersion`, allowing ingestion queries to apply the correct weight and detect mixed sampler populations.
+- Every emitted event must include the effective `SamplingRate`, `SamplerVersion`, and `SchemaVersion`, allowing ingestion queries to apply the correct weight and detect mixed sampler populations. `SamplerVersion=job-id-sha256-v1` defines the invariant JobID sampling key, so no separate `SamplingUnit` property is needed.
 
-This decision preserves resumptions but does not make a 1% job-ID sample suitable for exact account/endpoint metrics. A separate deterministic account/endpoint cohort would be required if longitudinal account-level analysis is added later.
+This decision preserves resumptions but does not make a 1% job-ID sample suitable for exact account metrics. A separate deterministic account cohort would be required if longitudinal account-level analysis is added later.
 
 ### Define Identity and Privacy Boundaries
 
-**Decision #3: the AzCopy client sends only storage account name or sanitized endpoint URL identity, execution geography, and the approved host attributes. It does not send tenant ID or subscription ID. Both IDs may be derived server-side from an Azure storage account name.**
+**Decision #3: the AzCopy client sends only normalized Azure storage account names and the approved host attributes. It does not send geography, S3/GCS bucket names, endpoint hostnames, tenant ID, or subscription ID. Geography is derived by Application Insights during ingestion; subscription and tenant IDs may be derived server-side from an Azure storage account name.**
 
 The identity contract is:
 
-- Prefer the normalized Azure storage account name when it can be parsed from a standard endpoint.
-- Otherwise use a sanitized endpoint URL identity containing only lowercase scheme, hostname, and a non-default port when present.
-- Never include URL user information, path, container/share/bucket/object name, query string, SAS token, or fragment in the endpoint identity.
-- Keep source and destination identities in separate fields. For local endpoints, emit no account/URL identity.
-- Geography is the execution geography of the host running AzCopy: execution region when obtained from IMDS, plus the approved country/timezone buckets. It is not the source or destination storage region.
-- Host attributes are limited to the reviewed schema fields such as OS family/version, architecture, CPU count/model or normalized family, total memory bucket, NIC-speed bucket, virtualization context, and invocation context.
+- Emit a normalized Azure storage account name when it can be parsed from a recognized endpoint.
+- Never include an S3/GCS bucket name, endpoint hostname, URL user information, path, container/share/filesystem/object name, query string, SAS token, or fragment.
+- Keep source and destination Azure storage account identities in separate fields. Non-Azure, local, custom-domain, emulator, and unparseable endpoints emit no client identity.
+- AzCopy emits no geography. Application Insights may derive country or region from the public sender IP observed during ingestion. This is not the source or destination storage region.
+- Host attributes are limited to the reviewed schema fields such as OS family/version, architecture, CPU count/model or normalized family, total memory bucket, NIC-speed bucket, Azure VM detection, and invocation context.
 - `TenantID` and `SubscriptionID` are prohibited **client fields**. AzCopy must not derive them from OAuth tokens, environment variables, or ARM calls.
 - In the trusted telemetry backend, resolve a normalized Azure storage account name to `DerivedSubscriptionID` and `DerivedTenantID`. Keep both derived values out of the raw client envelope and subject them to separate access, retention, and auditing controls.
 - Record enrichment status and version, for example `IdentityResolutionStatus` and `IdentityResolverVersion`, so queries can distinguish resolved, unresolved, stale, ambiguous, and non-Azure identities.
 - Do not assume every event is resolvable. Local endpoints, S3/GCS endpoints, custom domains, emulator endpoints, deleted accounts, and transient lookup failures may have no usable Azure subscription/tenant mapping.
 - For S2S jobs, enrich source and destination identities separately. Queries must choose an endpoint role or deduplicate by `JobID`; otherwise one job can be attributed to two subscriptions or tenants.
 
-Account/endpoint identity, execution geography, installation ID, and host attributes can still identify or fingerprint an organization or machine when combined. Privacy review must define retention, access controls, dashboard aggregation, and whether raw account names are permitted. A plain hash does not make this data anonymous, and a secret HMAC key cannot be protected in an open-source binary.
+Account identity, ingestion-derived geography, installation ID, and host attributes can still identify or fingerprint an organization or machine when combined. Privacy review must define retention, access controls, dashboard aggregation, and whether raw account names are permitted. A plain hash does not make this data anonymous, and a secret HMAC key cannot be protected in an open-source binary.
 
 ## Data Collection Feasibility
 
@@ -118,19 +116,17 @@ Account/endpoint identity, execution geography, installation ID, and host attrib
 
 | Requested data | Current state | Feasibility | Recommended collection contract |
 | --- | --- | --- | --- |
-| Command type | Implemented using the canonical full Cobra command path. Aliases resolve to the canonical name, and nested commands remain distinct. Commands designated for paired attempt events are excluded from `command.invoked`; benchmark uses `Command=bench` and resume uses `Command=jobs.resume`. | Available | Keep the inventory synchronized with command registration. |
+| Command type | Implemented using the canonical full Cobra command path. Aliases resolve to the canonical name, and nested commands remain distinct. Commands designated for paired attempt events and tooling-only commands are excluded from `command.invoked`; benchmark uses `Command=bench` and resume uses `Command=jobs.resume`. | Available | Keep the inventory synchronized with command registration. |
 | Flags and environment overrides used | Implemented. Cobra's explicitly changed flags and explicitly set reviewed environment variables are sorted, deduplicated, and emitted as `OptFlagsSet` and `OptEnvVarsSet`. Selected safe values are normalized into individual `Opt*` properties. Built-in defaults are omitted. | Available | Keep every registered flag explicitly classified as value, presence-only, or denied. Values for credentials, identity, paths, filters, metadata, tags, headers, and arbitrary content are never read. |
-| AzCopy version | Available as `ServiceVersion`. | Available | Keep the semantic version and add build channel (`test`, `preview`, `GA`) separately. |
-| Secrets redacted | Partial by construction because flag values are omitted. There is no general redaction validation. Other fields intentionally contain account/bucket names. | Moderate | Add schema-level tests proving that SAS, keys, tokens, paths, command strings, and environment values cannot enter telemetry. Avoid describing the entire payload as anonymous until privacy review closes. |
+| AzCopy version | Available as `AzCopyVersion`. Historical rows used `ServiceVersion`; dashboard queries coalesce both names during migration. | Available | Keep the semantic version and add build channel (`test`, `preview`, `GA`) separately. |
+| Secrets redacted | Partial by construction because flag values are omitted. There is no general redaction validation. Other fields intentionally contain Azure storage account names. | Moderate | Add schema-level tests proving that SAS, keys, tokens, paths, command strings, and environment values cannot enter telemetry. Avoid describing the entire payload as anonymous until privacy review closes. |
 
 Canonical `command.invoked` values are:
 
-- Visible: `doc`, `env`, `jobs.clean`, `jobs.list`, `jobs.remove`, `jobs.show`, `list`, `login`, `login.status`, `logout`, `make`, `remove`, and `set-properties`.
+- Visible: `jobs.clean`, `jobs.list`, `jobs.remove`, `jobs.show`, `list`, `login`, `login.status`, `logout`, `make`, `remove`, and `set-properties`.
 - Hidden: `cancel` and `pause`.
-- Hidden/deprecated on Linux: `load.clfs`.
-- Cobra-generated executable commands, such as `help`, use the same canonical-path rule when they pass through the root pre-run hook.
 
-The following commands do **not** emit `command.invoked` because they use, or are designated to use, paired job-attempt start/finish events: `bench`, `copy`, `jobs.resume`, and `sync`. Parent-only groups such as `jobs` and `load` are not executable leaves and do not emit invocation events. Aliases such as `cp`, `benchmark`, `ls`, `rm`, and `set-props` are recorded under their canonical values rather than as separate commands.
+The following commands do **not** emit `command.invoked` because they use, or are designated to use, paired job-attempt start/finish events: `bench`, `copy`, `jobs.resume`, and `sync`. Tooling-only commands `help`, `completion`, `__complete`, `__completeNoDesc`, `doc`, `env`, and the hidden/deprecated `load.clfs` are also excluded. Parent-only groups such as `jobs` and `load`, the root invocation, `--help`, and `--version` do not emit invocation events. Aliases such as `cp`, `benchmark`, `ls`, `rm`, and `set-props` are recorded under their canonical values rather than as separate commands.
 
 ### Option Collection Contract
 
@@ -139,6 +135,7 @@ The following commands do **not** emit `command.invoked` because they use, or ar
 - `OptFlagsSet` and `OptEnvVarsSet` contain reviewed names only.
 - Selected values use fixed `Opt*` property names and type-aware normalization. Numeric values remain exact so dashboards can define and revise buckets server-side.
 - Invalid values may still appear in the presence list, but their value property is omitted. Normal AzCopy validation remains authoritative.
+- Every emitted property value has a 1,024-byte default cap before export. Identifiers, categories, host/account text, endpoint identities, compact lists, and normalized option values use lower property-specific caps where possible. Truncation is UTF-8 safe and shared by the direct Application Insights and OTel paths.
 - Positional arguments and unreviewed values are never inspected.
 - The same option object is cloned into command events and paired copy/sync job events. Unset option properties are absent, not `false`, `0`, `None`, or another default.
 
@@ -184,8 +181,8 @@ Evidence: [cmd/root.go](cmd/root.go), [azcopy/telemetry.go](azcopy/telemetry.go)
 | CPU count | Available as `HostNumCPU`. | Available | Bucket very large values if dashboard cardinality becomes an issue. |
 | CPU model | Available as `HostCPUModel`. | Available | Consider a normalized CPU-family bucket. The raw model contributes to machine fingerprinting. |
 | Memory | Available as total physical GB in `HostMemoryTotalGB`, not memory used by AzCopy. | Available for capacity; Moderate for process usage | Keep `HostMemoryTotalGB`. If the business need is AzCopy memory pressure, add peak working set separately. |
-| Network | Implemented as separate execution context, job/transfer-phase throughput, Storage-operation latency/rate, raw network operation/error counts, and categorized server-busy 503 counts/rates. Adapter type and actual available bandwidth remain unknown. | Available/Partial | Keep the individual metric names and raw numerators. Do not present NIC link speed as measured bandwidth or 503 count as comprehensive retries. |
-| NIC speed | Implemented as exact best-effort `HostNICSpeedMbps`, `HostNICSpeedAvailable`, and coarse `HostNICSpeedBucket`. It may not be the interface used by AzCopy. | Available/Partial | Do not call this measured network capacity. Use the bucket for aggregate dashboards and exact value for diagnostics. |
+| Network | Implemented as Azure VM detection, job/transfer-phase throughput, Storage-operation latency/rate, raw network operation/error counts, and categorized server-busy 503 counts/rates. Adapter type and actual available bandwidth remain unknown. | Available/Partial | Keep the individual metric names and raw numerators. Do not present NIC link speed as measured bandwidth or 503 count as comprehensive retries. |
+| NIC speed | Implemented as exact best-effort `HostNICSpeedMbps` and coarse `HostNICSpeedBucket`; `-1` and `unknown` indicate an unavailable probe. It may not be the interface used by AzCopy. | Available/Partial | Do not call this measured network capacity. Use the bucket for aggregate dashboards and exact value for diagnostics. |
 | File protocol | Available as source/destination protocol. | Available | Keep separate source and destination fields. For local paths, optionally distinguish local disk, SMB, and NFS using mount detection. |
 | Platform (Windows/Linux) | Available as `OSType`; OS version and architecture are also emitted. | Available | Use a low-cardinality OS family for dashboards; tightly restrict access to full OS-version plus host combinations. |
 
@@ -212,27 +209,42 @@ Evidence: [azcopy/hostinfo.go](azcopy/hostinfo.go), platform-specific `hostinfo`
 
 The best bounded collection point for **scheduled copy work** is `CopyTransferProcessor.scheduleTransfer`, which receives `StoredObject.Size`, `EntityType`, `RelativePath`, and `ContainerName`. For the shape of the complete source dataset, counters must be placed earlier in the traverser pipeline. This distinction is especially important for sync: it enumerates both sides and schedules only differences, so source-shape, destination-shape, and scheduled-delta statistics require separate counters. Benchmark upload shape can be taken directly from its generated file-count, file-size, and folder-count inputs. See [azcopy/zc_processor.go](azcopy/zc_processor.go), [traverser/zc_enumerator.go](traverser/zc_enumerator.go), and [cmd/benchmark.go](cmd/benchmark.go).
 
-### Copy, Sync, and Benchmark: Account/Endpoint Identity and Geography
+### Copy, Sync, and Benchmark: Account Identity and Geography
 
 | Requested data | Current state | Feasibility | Recommended collection contract |
 | --- | --- | --- | --- |
 | Azure storage account name | Available as an unhashed DNS label. Decision #3 approves this identity type, subject to privacy controls. | Available | Normalize to lowercase and emit separately for source and destination. Do not append container, share, filesystem, or object paths. |
-| Sanitized endpoint URL identity | Implemented as source/destination fallback when recognized account/bucket identity cannot be parsed. Contains only lowercase scheme, hostname, and non-default port. | Available | User info, path, query, SAS, and fragment are stripped. |
 | Subscription ID | Not emitted by AzCopy. The backend can resolve a standard Azure storage account name to its subscription. | Server-side derived | Add no client field or ARM call. Enrich as `DerivedSubscriptionID` after ingestion, retain resolution status/version, and apply restricted access controls. |
 | Tenant ID | Not emitted by AzCopy. The backend can resolve the account's owning tenant together with subscription identity. | Server-side derived | Add no client field or token-claim parsing. Enrich as `DerivedTenantID` after ingestion with the same status, versioning, and access controls as subscription enrichment. |
-| Execution geography | Current `GeoRegion`, `GeoCountry`, and `GeoTimezone` describe the host running AzCopy. | Available/Partial | Rename `GeoRegion` to `ExecutionRegion` and document IMDS/unknown behavior. Use reviewed country and timezone buckets. Do not label these values as storage geography. |
+| Execution geography | No geography is emitted by the AzCopy client. Application Insights derives `client_CountryOrRegion` from the sender IP during ingestion and masks the stored IP by default. | Server-side derived | Use only the ingestion-derived country/region field for aggregate dashboards; do not add client-side IP lookup or expose city/state without separate approval. |
 | Storage region | Not emitted and not encoded in normal data-plane endpoints. | Out of current scope | Subscription enrichment does not imply storage-region collection. Add region only through a separately approved server-side enrichment if a business need is established. |
-| S3/GCS identity | Bucket names are currently placed in storage-account fields. Decision #3 permits an account name or sanitized endpoint URL, not resource paths. | Clarify/Low | Prefer sanitized provider endpoint identity. Collect a bucket name only if privacy review explicitly treats it as the approved provider equivalent of an account name; never include object prefixes. |
-| Cloud type | Implemented independently as `SourceCloudType` and `DestCloudType` for Azure endpoints, with values `public`, `gov`, `china`, or `germany`. Non-Azure endpoints are empty and remain identified by endpoint type. The combined `CloudType` is retained for schema compatibility. | Available | Prefer the role-specific fields in new queries. Retire the combined compatibility field only through a future versioned schema change. |
+| S3/GCS identity | Bucket names are not emitted. S3/GCS remain distinguishable through endpoint type, protocol, topology, and aggregate bucket counters. | Not collected | Keep bucket names and object prefixes out of client telemetry. |
+| Cloud type | Implemented independently as `SourceCloudType` and `DestCloudType` for Azure endpoints, with values `public`, `gov`, `china`, `germany`, or `unknown`. Non-Azure endpoints are empty and remain identified by endpoint type. | Available | Use the role-specific fields so cross-environment transfers remain unambiguous. |
 | Authentication mechanism | Implemented with distinct `SAS`, `PublicAnonymous`, provider/OAuth/shared-key values, and `NotApplicable` for local/pipe/benchmark endpoints. | Available | Classification uses parsed SAS presence only; credential material is never emitted. |
 
-Evidence: `storageAccountName`, `hostOf`, `cloudType`, geography, and credential dimensions in [azcopy/telemetry.go](azcopy/telemetry.go).
+Evidence: `storageAccountName`, `hostOf`, `endpointCloudType`, and credential dimensions in [azcopy/telemetry.go](azcopy/telemetry.go), plus Application Insights ingestion context fields.
+
+#### IP Geolocation Feasibility
+
+Do not add an AzCopy-side IP geolocation call. Application Insights already performs IP geolocation during ingestion and exposes the result on custom events as `client_CountryOrRegion`, `client_StateOrProvince`, and `client_City`. By default, the ingestion service temporarily uses the sender IP for lookup, discards it, and stores `client_IP=0.0.0.0`. This behavior was verified on the telemetry test component: recent AzCopy custom events had populated country/region/city fields while the stored IP remained masked.
+
+Country-level analysis can use the built-in field without increasing the AzCopy payload:
+
+```kusto
+customEvents
+| where name startswith 'azcopy.'
+| extend ExecutionCountry = tostring(client_CountryOrRegion)
+```
+
+This value represents the public network egress observed by Application Insights, not a guaranteed physical user location. Corporate NAT, VPNs, proxies, cloud runners, and forwarding infrastructure can move or obscure it. It may be empty when IP collection is unavailable or disabled. Country-level aggregation should remain subject to privacy review, and city/state fields should not be exposed unless separately justified.
+
+A client-side implementation is technically possible through a third-party/Azure geolocation API or a bundled IP database, but is not recommended. An external API adds startup latency, an additional outbound dependency, proxy/firewall failure modes, service cost, credential distribution problems for an open-source binary, and disclosure to another processor. A bundled database adds binary/update/licensing cost and still cannot geolocate private interface addresses without separately discovering the public egress IP. Application Insights ingestion enrichment is therefore the preferred implementation.
 
 ### Copy and Sync: Execution and Outcome
 
 | Requested data | Current state | Feasibility | Recommended collection contract |
 | --- | --- | --- | --- |
-| Job status | Implemented for copy/sync attempts that emit `job.started`: a deferred finalizer emits exactly one `job.finished` for success, partial success, enumeration/manager failure, and explicit cancellation. | Available | `TerminalReason` is completed, completed-with-errors, failed, or cancelled; `TerminalStage` identifies the bounded lifecycle stage. Hard process termination remains ingestion-inferred abandonment. |
+| Job status | Implemented for copy/sync attempts that emit `job.started`: a deferred finalizer emits exactly one `job.finished` for success, partial success, enumeration/manager failure, and explicit cancellation. | Available | `JobStatus` carries the detailed outcome and `TerminalStage` identifies the bounded lifecycle stage. Hard process termination remains ingestion-inferred abandonment. |
 | Error code if failed | Implemented as bounded `JobErrorCategory` and sanitized `JobErrorCode` on failed/partial-success finishes. Typed service, timeout, network, local-I/O, AzCopy, and lifecycle-stage failures are classified without raw messages. | Available/Partial | Service codes are limited to 64 safe ASCII characters; untyped errors use fixed stage codes. Transfer HTTP histograms remain separate. Some provider-specific errors can only use the stage fallback until typed adapters are added. |
 | Files transferred | Implemented as `ObjectsCompleted`, excluding folder-property transfers, with scheduled regular-file/symlink/converted-hardlink breakdown. | Available | Existing aggregate transfer counts remain for compatibility. |
 | Passed files | Defined as completed payload objects and represented by `ObjectsCompleted`; no duplicate “passed” metric is emitted. | Available | Use the completed object count consistently. |
@@ -246,7 +258,7 @@ Evidence: `storageAccountName`, `hostOf`, `cloudType`, geography, and credential
 | Latency | Emitted as `AverageStorageHTTPAttemptE2EMs`, the mean duration of an HTTP attempt observed by the SDK per-retry policy. Retries are separate attempts. | Available/Partial | It is not whole-job latency, logical-operation latency, network round-trip time, or a percentile. |
 | Average network speed | `JobThroughputMbps` covers the full attempt; `TransferPhaseThroughputMbps` uses first-part-ordered through terminal wait and may overlap enumeration. | Available | Use job throughput for customer experience and transfer-phase throughput for transfer performance. Neither is physical link capacity. |
 | Retry count | `ServerBusy503Count` and throughput/IOPS/other categories are emitted with operation counts. They do not include every SDK, network, or body-read retry. | Partial | Add explicit SDK retry-policy and body-read retry instrumentation before calling any metric comprehensive retry count. |
-| Resume count | Implemented through paired events with the reused `RunID`, a new `InvocationID`, and `AttemptType=resume`. | Available | Count resume starts and terminal outcomes. Resume transfer measurements have `MeasurementScope=job-cumulative` and are not attempt deltas. |
+| Resume count | Implemented through `Command=jobs.resume`, paired events with the reused `JobID`, and a new `InvocationID`. | Available | Count resume starts and terminal outcomes. Resume job-plan summary counters have `SummaryCounterScope=job-cumulative`; invocation durations remain attempt-scoped. |
 | Restart count | Ambiguous. AzCopy has restarted transfer status during resume, but no logical job restart concept. | Clarify/Moderate | Define restart as whole-command rerun, resumed transfer, or internally restarted file. Use separate counters if more than one is needed. |
 | Percentage complete at cancellation | Emitted from the live summary with transferred/expected bytes and object counts when available. | Available/Partial | Cancellation before any job part exists can legitimately report zero progress. |
 
@@ -256,9 +268,9 @@ Existing source data is in `ListJobSummaryResponse`, `PipelineNetworkStats`, and
 
 | Requested data | Current state | Feasibility | Recommended collection contract |
 | --- | --- | --- | --- |
-| Result code | Implemented. Main benchmark events use `Command=bench` and `BenchmarkMode`; generic `JobStatus`, `TerminalReason`, and job-error fields are the result contract. Automatic cleanup jobs do not emit benchmark events. | Available | Do not add a duplicate benchmark-only result code. Use the generic terminal contract for consistent reliability analysis. |
+| Result code | Implemented. Main benchmark events use `Command=bench` and `BenchmarkMode`; generic `JobStatus`, `TerminalStage`, and job-error fields are the result contract. Automatic cleanup jobs do not emit benchmark events. | Available | Do not add a duplicate benchmark-only result code. Use the generic terminal contract for consistent reliability analysis. |
 | Description | Excluded by design. Human-readable benchmark/performance-advice descriptions are not emitted. | Excluded | Generate descriptions from stable codes in dashboards or UI. |
-| Reason | Implemented as bounded `PerformanceAdviceCodes`, `PrimaryPerformanceAdviceCode`, and `PerformanceConstraint`. Human-readable title/reason text is excluded. | Available | Keep advice code sanitization and cardinality bounds. |
+| Reason | Implemented as bounded, priority-ordered `PerformanceAdviceCodes` and `PerformanceConstraint`. Human-readable title/reason text is excluded. | Available | The first advice code is primary. Keep advice code sanitization and cardinality bounds. |
 | Diagnostic statistics | Generic finish measurements provide IOPS, Storage HTTP attempt latency/count, server-busy and network-error counts/rates, bytes, durations, and throughput. Effective file count, file size, folder count, mode, cleanup request, and cleanup marker are benchmark dimensions. | Available | Reuse generic measurements; do not emit a second diagnostic payload. |
 
 Benchmark inputs are converted into a copy job in [cmd/benchmark.go](cmd/benchmark.go). Performance advice is defined in [common/fe-ste-models.go](common/fe-ste-models.go).
@@ -272,8 +284,8 @@ Benchmark inputs are converted into a copy job in [cmd/benchmark.go](cmd/benchma
 | Redaction status | No explicit redaction result exists. | Moderate after bundle feature exists | The redaction component must produce a versioned outcome. Do not infer success from bundle creation. |
 | Support case linkage | No support case integration exists. | External | Store the AzCopy invocation/job ID in the support system rather than placing case IDs in general product telemetry. |
 | ICM linkage | No ICM integration exists. | External | Join in the incident/support system with restricted access. |
-| Command invocation ID | Implemented as random 128-bit `InvocationID` per command/job attempt. Copy/sync/benchmark/resume start and finish share it; `RunID` remains the resumable job key. | Available | Use `AttemptType` to distinguish original and resume attempts. |
-| Job ID | Available as `RunID` for job events and resume command invocation. | Available | Rename the field to `JobID`. Reuse it across the original and resume attempts as the correlation key. |
+| Command invocation ID | Implemented as random 128-bit `InvocationID` per command/job attempt. Copy/sync/benchmark/resume start and finish share it; `JobID` remains the resumable job key. | Available | Use `Command=jobs.resume` to distinguish resume attempts. |
+| Job ID | Available as `JobID` for job events and command invocations that have an AzCopy job identifier. | Available | Reuse it across the original and resume attempts as the correlation key. |
 | Top error category | A coarse job-level category set exists (`authentication`, `authorization`, `throttling`, `timeout`, `network`, `local-io`, `conflict`, `not-found`, `service`, `azcopy`, lifecycle stages, and `unknown`). It is not independently versioned, provider-complete, or unified with numeric transfer outcomes and performance-advice codes. | Moderate | Add `ErrorTaxonomyVersion` and a documented mapping contract. Preserve provider code separately from normalized category, stage, endpoint role, retryability, and remediation code. |
 | Remediation shown | Not captured. Some performance advice is shown. | Low for owned advice | Emit an advice/remediation code when AzCopy actually displays it. Do not emit full text. |
 | Remediation attempted | Usually not observable unless the user invokes a specific AzCopy action. | Partial/External | Record only explicit in-product actions and correlate by invocation ID. Do not infer user behavior outside AzCopy. |
@@ -309,7 +321,7 @@ For this assessment, “per customer” means **per `DerivedSubscriptionID`**, m
 | Week-over-week job frequency | Derived subscription/tenant ID, endpoint role, job ID, timestamp | Partially covered after enrichment. | Trends are estimable for high-volume subscriptions if sampling is stable; sparse subscriptions need a subscription/account cohort sampler. |
 | AzCopy version in use | Derived subscription/tenant ID, endpoint role, service version, timestamp | Covered as observed sampled version usage. | Report version distribution or most recently observed sampled version, not a definitive current version. |
 | Retry count per job | Comprehensive retry counters | Not covered. Only 503 count is cheaply available. | Sampled distributions are valid after instrumentation; totals require weighting. |
-| Resume/restart count per job | Attempt start/outcome events, `InvocationID`, shared `JobID`, `AttemptType`, and restart definition | Resume is covered; restart remains undefined. | Count `AttemptType=resume` by `RunID`. Deterministic `JobID` sampling keeps all attempts for an included job together. Do not sum cumulative resume measurements. |
+| Resume/restart count per job | Attempt start/outcome events, `InvocationID`, shared `JobID`, `Command`, and restart definition | Resume is covered; restart remains undefined. | Count `Command=jobs.resume` by `JobID`. Deterministic `JobID` sampling keeps all attempts for an included job together. Do not sum cumulative resume summary counters. |
 | Abandonment rate and percent complete | Complete canceled/terminated finish events, expected/transferred work | Not reliable in the current branch because cancellations and killed processes may not send finish. | A hard-killed process can never send a final event. Derive probable abandonment server-side from sampled `started` events with no matching finish after a timeout, and report it separately from explicit cancellation. |
 
 Conclusion: server enrichment restores the earlier subscription-level business assessment, with optional tenant rollups. Totals, distributions, and rates are estimable; exact recency and complete longitudinal history are not supported by 1% `JobID` sampling and would require a subscription/account cohort.
@@ -318,7 +330,7 @@ Conclusion: server enrichment restores the earlier subscription-level business a
 
 | Business metric | Required signals | Coverage assessment | Sampling/interpretation |
 | --- | --- | --- | --- |
-| Data transferred by on-prem-to-Azure, Azure-to-Azure, AWS-to-Azure, and GCS-to-Azure | Source/destination type, `FromTo`, topology, bytes | Implemented for emitted jobs. `TransferTopology` now distinguishes `aws-to-azure`, `gcs-to-azure`, `intra-azure`, `local-to-azure`, and `azure-to-local`. Early failures before paired-event initialization remain absent. | Estimate totals with inverse-probability weighting and include confidence bounds for small categories. Track unmatched or pre-initialization failures separately. |
+| Data transferred by on-prem-to-Azure, Azure-to-Azure, AWS-to-Azure, and GCS-to-Azure | Source/destination type, `FromTo`, bytes | Implemented for emitted jobs. Dashboards derive `aws-to-azure`, `gcs-to-azure`, `intra-azure`, `local-to-azure`, and `azure-to-local` from canonical endpoint types. Early failures before paired-event initialization remain absent. | Estimate totals with inverse-probability weighting and include confidence bounds for small categories. Track unmatched or pre-initialization failures separately. |
 | Average time to migrate per TB by category | Topology, bytes, duration, status | Covered after terminal-event fix. | Exclude zero-byte jobs; stratify by job-size buckets because tiny jobs produce unstable per-TB normalization. |
 | Throughput P50/P90/P95 | Job throughput, topology, job-size bucket | Covered for current job-level throughput. | A 1% sample can support percentiles when the resulting sample count is adequate. Always show `n`; rare categories may be unusable. |
 | Time to complete per TB | Bytes, duration, topology | Covered after terminal-event fix. | Same caveat as average migration time. Specify mean versus median/percentile. |
@@ -391,7 +403,7 @@ Completed in this branch: deterministic JobID sampling and sampler metadata; per
 ### Release-Blocking
 
 1. Infer hard-kill abandonment at ingestion for starts with no terminal event after a defined timeout.
-2. Complete privacy review for account/endpoint identity, geography, installation ID, and host attributes.
+2. Complete privacy review for account identity, geography, installation ID, and host attributes.
 3. Populate the Test/Prod secure pipeline variables and verify ingestion from E2E, preview, and GA artifacts.
 4. Decide explicitly whether dry-run paired events are in scope; currently no transfer start/finish is emitted for dry run.
 
@@ -416,7 +428,7 @@ Completed in this branch: deterministic JobID sampling and sampler metadata; per
 
 - Command and flag-name adoption.
 - Version, OS, host-capacity, endpoint, protocol, cloud, and authentication mix.
-- Job and byte volume by transfer category using the corrected provider-specific `TransferTopology` values.
+- Job and byte volume by provider-specific transfer categories derived from `FromTo`, `SourceType`, and `DestType`.
 - Job throughput, operation latency, IOPS, server-busy rate, and network-error rate.
 - Success, partial-success, failure, cancellation, failed-object, and top-error distributions after lifecycle fixes.
 - Benchmark outcome, input-shape, performance-advice, and diagnostic analysis. Description text is intentionally excluded.
@@ -432,7 +444,7 @@ Completed in this branch: deterministic JobID sampling and sampler metadata; per
 
 ## Final Recommendation
 
-Approve the telemetry pipeline initially for AzCopy-wide, account/endpoint-level, and server-enriched subscription/tenant-level product usage, performance, and reliability estimates, contingent on sampling, lifecycle completeness, enrichment quality, and privacy review. Treat longitudinal funnels and supportability reporting as separate projects with their own sampling, governance, and external-integration designs.
+Approve the telemetry pipeline initially for AzCopy-wide, account-level, and server-enriched subscription/tenant-level product usage, performance, and reliability estimates, contingent on sampling, lifecycle completeness, enrichment quality, and privacy review. Treat longitudinal funnels and supportability reporting as separate projects with their own sampling, governance, and external-integration designs.
 
 This scope provides useful decision data without making statistically or technically unsupported claims from the current two-event, 1%-sampled client telemetry model.
 

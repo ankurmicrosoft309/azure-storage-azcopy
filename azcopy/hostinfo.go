@@ -21,10 +21,7 @@
 package azcopy
 
 import (
-	"bytes"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -62,8 +59,7 @@ const imdsTimeout = 1 * time.Second
 
 // imdsInfo captures the subset of IMDS data the telemetry agent cares about.
 type imdsInfo struct {
-	isAzureVM bool   // true when IMDS responded (i.e. running on an Azure VM)
-	region    string // compute.location, e.g. "eastus"; "" when unavailable
+	isAzureVM bool // true when IMDS responded (i.e. running on an Azure VM)
 }
 
 // probeIMDS queries the Azure Instance Metadata Service to determine whether
@@ -96,102 +92,7 @@ func probeIMDSWithClient(client *http.Client) imdsInfo {
 		return imdsInfo{isAzureVM: true}
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return imdsInfo{isAzureVM: true}
-	}
-	return imdsInfo{isAzureVM: true, region: strings.TrimSpace(buf.String())}
-}
-
-// ---------------------------------------------------------------------------
-// Geo (best-effort, no network)
-// ---------------------------------------------------------------------------
-
-// geoTimezone returns the IANA timezone name (e.g. "America/Los_Angeles") on a
-// best-effort basis. It consults, in order: the TZ environment variable, the
-// /etc/timezone file, and the symlink target of /etc/localtime. It falls back to
-// the local zone abbreviation reported by the Go runtime. Returns "" only when
-// nothing is determinable.
-func geoTimezone() string {
-	return geoTimezoneFrom(os.Getenv, os.ReadFile, os.Readlink, localZoneAbbrev)
-}
-
-// geoTimezoneFrom is the testable core of geoTimezone with its environment and
-// filesystem dependencies injected.
-func geoTimezoneFrom(getenv func(string) string, readFile func(string) ([]byte, error), readlink func(string) (string, error), zoneAbbrev func() string) string {
-	if tz := strings.TrimSpace(getenv("TZ")); tz != "" {
-		return tz
-	}
-	if b, err := readFile("/etc/timezone"); err == nil {
-		if tz := strings.TrimSpace(string(b)); tz != "" {
-			return tz
-		}
-	}
-	if target, err := readlink("/etc/localtime"); err == nil {
-		if tz := zoneNameFromZoneinfoPath(target); tz != "" {
-			return tz
-		}
-	}
-	return zoneAbbrev()
-}
-
-// zoneNameFromZoneinfoPath extracts the IANA zone name from a zoneinfo path such
-// as "/usr/share/zoneinfo/America/Los_Angeles" -> "America/Los_Angeles".
-func zoneNameFromZoneinfoPath(p string) string {
-	p = filepath.ToSlash(p)
-	const marker = "zoneinfo/"
-	if i := strings.LastIndex(p, marker); i >= 0 {
-		return strings.Trim(p[i+len(marker):], "/")
-	}
-	return ""
-}
-
-// localZoneAbbrev returns the local timezone abbreviation (e.g. "PST") as a last
-// resort when the IANA name cannot be determined.
-func localZoneAbbrev() string {
-	name, _ := time.Now().Zone()
-	return name
-}
-
-// geoCountry returns a best-effort ISO 3166-1 alpha-2 country code derived from
-// the process locale (LC_ALL / LC_MESSAGES / LANG), e.g. "US" from
-// "en_US.UTF-8". Returns "" when no locale country can be determined.
-func geoCountry() string {
-	return geoCountryFrom(os.Getenv)
-}
-
-// geoCountryFrom is the testable core of geoCountry.
-func geoCountryFrom(getenv func(string) string) string {
-	for _, k := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
-		if c := countryFromLocale(getenv(k)); c != "" {
-			return c
-		}
-	}
-	return ""
-}
-
-// countryFromLocale parses a POSIX locale string like "en_US.UTF-8" or "en_US"
-// and returns the upper-cased two-letter country code ("US"), or "" if absent.
-func countryFromLocale(locale string) string {
-	locale = strings.TrimSpace(locale)
-	if locale == "" || strings.EqualFold(locale, "C") || strings.EqualFold(locale, "POSIX") {
-		return ""
-	}
-	// Strip codeset / modifier: en_US.UTF-8@euro -> en_US
-	if i := strings.IndexAny(locale, ".@"); i >= 0 {
-		locale = locale[:i]
-	}
-	i := strings.IndexByte(locale, '_')
-	if i < 0 || i+3 > len(locale) {
-		return ""
-	}
-	cc := locale[i+1 : i+3]
-	for _, r := range cc {
-		if r < 'A' || (r > 'Z' && r < 'a') || r > 'z' {
-			return ""
-		}
-	}
-	return strings.ToUpper(cc)
+	return imdsInfo{isAzureVM: true}
 }
 
 // ---------------------------------------------------------------------------

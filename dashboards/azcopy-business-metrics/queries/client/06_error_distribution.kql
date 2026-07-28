@@ -1,9 +1,13 @@
 // Visual: Bar chart
 // Category axis: Error; Value: EstimatedAttempts
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
 | where name == 'azcopy.job.finished'
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | extend
     ErrorCategory = tostring(customDimensions.JobErrorCategory),
     ErrorCode = tostring(customDimensions.JobErrorCode),

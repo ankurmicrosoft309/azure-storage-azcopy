@@ -53,7 +53,7 @@ func (r *Reporter) ReportEvent(ctx context.Context, evt MetricEvent) error {
 }
 
 // ---------------------------------------------------------------------------
-// App Insights path – hand-built envelopes, one per measurement.
+// App Insights path - one packed custom event per lifecycle event.
 // ---------------------------------------------------------------------------
 
 func (r *Reporter) sendEventAppInsights(ctx context.Context, evt MetricEvent) error {
@@ -71,31 +71,36 @@ func (r *Reporter) sendEventAppInsights(ctx context.Context, evt MetricEvent) er
 		return err
 	}
 
-	log.Printf("telemetry: sent %s (%d measurements) to App Insights", evt.EventName(), len(envelopes))
+	log.Printf("telemetry: sent packed %s event to App Insights", evt.EventName())
 	return nil
 }
 
-// eventToEnvelopes converts an event into one App Insights envelope per
-// measurement. The Track API accepts a batch of envelopes, but only ingests the
-// first metric when multiple metrics share one envelope.
+// eventToEnvelopes converts an event into one App Insights custom event. Numeric
+// measurements share the row's dimensions instead of repeating them in one
+// metric envelope per measurement.
 func eventToEnvelopes(ikey string, evt MetricEvent) []appInsightsEnvelope {
 	measurements := evt.measurements()
-	envelopes := make([]appInsightsEnvelope, 0, len(measurements))
-	timestamp := evt.timestamp().UTC().Format(time.RFC3339)
-	properties := evt.attributes()
-	for _, m := range measurements {
-		envelopes = append(envelopes, appInsightsEnvelope{
-			Name: "Microsoft.ApplicationInsights.Metric",
-			Time: timestamp,
-			IKey: ikey,
-			Data: appInsightsData{
-				BaseType: "MetricData",
-				BaseData: appInsightsMetricData{
-					Metrics:    []appInsightsMetric{{Name: m.Name, Value: m.Value, Count: m.Count}},
-					Properties: properties,
-				},
-			},
-		})
+	if len(measurements) == 0 {
+		return nil
 	}
-	return envelopes
+
+	packedMeasurements := make(map[string]float64, len(measurements))
+	for _, m := range measurements {
+		packedMeasurements[m.Name] = m.Value
+	}
+
+	return []appInsightsEnvelope{{
+		Name: "Microsoft.ApplicationInsights.Event",
+		Time: evt.timestamp().UTC().Format(time.RFC3339),
+		IKey: ikey,
+		Data: appInsightsData{
+			BaseType: "EventData",
+			BaseData: appInsightsEventData{
+				Version:      2,
+				Name:         evt.EventName(),
+				Properties:   evt.attributes(),
+				Measurements: packedMeasurements,
+			},
+		},
+	}}
 }

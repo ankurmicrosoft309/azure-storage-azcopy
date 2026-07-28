@@ -132,7 +132,13 @@ func (r *Reporter) sendEventOTel(ctx context.Context, evt MetricEvent) error {
 		return err
 	}
 
-	exporter := &appInsightsExporter{endpoint: endpoint, ikey: ikey, client: r.httpClient()}
+	exporter := &appInsightsExporter{
+		endpoint:  endpoint,
+		ikey:      ikey,
+		client:    r.httpClient(),
+		eventName: evt.EventName(),
+		timestamp: evt.timestamp(),
+	}
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
@@ -179,7 +185,7 @@ func (r *Reporter) sendEventOTel(ctx context.Context, evt MetricEvent) error {
 		return fmt.Errorf("export metrics: %w", err)
 	}
 
-	log.Printf("telemetry: sent %s (%d measurements) to App Insights via OTel SDK", evt.EventName(), len(evt.measurements()))
+	log.Printf("telemetry: sent packed %s event to App Insights via OTel SDK", evt.EventName())
 	return nil
 }
 
@@ -195,9 +201,11 @@ func propsToAttributes(props map[string]string) []attribute.KeyValue {
 // appInsightsExporter implements a lightweight OTel metric exporter
 // that sends data to the Application Insights /v2.1/track endpoint.
 type appInsightsExporter struct {
-	endpoint string
-	ikey     string
-	client   httpDoer
+	endpoint  string
+	ikey      string
+	client    httpDoer
+	eventName string
+	timestamp time.Time
 }
 
 func (e *appInsightsExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
@@ -231,16 +239,18 @@ func (e *appInsightsExporter) Export(ctx context.Context, rm *metricdata.Resourc
 // metricPoint is a single data point extracted from OTel metric data, carrying
 // the attribute set it was recorded with.
 type metricPoint struct {
-	metric appInsightsMetric
-	props  map[string]string
+	name  string
+	value float64
+	props map[string]string
 }
 
 func metricToPoints(m metricdata.Metrics) []metricPoint {
 	var points []metricPoint
 	add := func(value float64, count int, attrs attribute.Set) {
 		points = append(points, metricPoint{
-			metric: appInsightsMetric{Name: m.Name, Value: value, Count: count},
-			props:  attrsToProps(attrs),
+			name:  m.Name,
+			value: value,
+			props: attrsToProps(attrs),
 		})
 	}
 
@@ -274,27 +284,32 @@ func metricToPoints(m metricdata.Metrics) []metricPoint {
 	return points
 }
 
-// pointsToEnvelopes emits one envelope per data point. The Track API accepts
-// multiple envelopes in one batch, but only ingests the first metric when an
-// envelope contains multiple metrics.
+// pointsToEnvelopes packs all data points from one MetricEvent into one custom
+// event row. All points recorded by sendEventOTel carry the same properties.
 func (e *appInsightsExporter) pointsToEnvelopes(points []metricPoint) []appInsightsEnvelope {
-	ts := time.Now().UTC().Format(time.RFC3339)
-	envelopes := make([]appInsightsEnvelope, 0, len(points))
-	for _, point := range points {
-		envelopes = append(envelopes, appInsightsEnvelope{
-			Name: "Microsoft.ApplicationInsights.Metric",
-			Time: ts,
-			IKey: e.ikey,
-			Data: appInsightsData{
-				BaseType: "MetricData",
-				BaseData: appInsightsMetricData{
-					Metrics:    []appInsightsMetric{point.metric},
-					Properties: point.props,
-				},
-			},
-		})
+	if len(points) == 0 {
+		return nil
 	}
-	return envelopes
+
+	measurements := make(map[string]float64, len(points))
+	for _, point := range points {
+		measurements[point.name] = point.value
+	}
+
+	return []appInsightsEnvelope{{
+		Name: "Microsoft.ApplicationInsights.Event",
+		Time: e.timestamp.UTC().Format(time.RFC3339),
+		IKey: e.ikey,
+		Data: appInsightsData{
+			BaseType: "EventData",
+			BaseData: appInsightsEventData{
+				Version:      2,
+				Name:         e.eventName,
+				Properties:   points[0].props,
+				Measurements: measurements,
+			},
+		},
+	}}
 }
 
 func attrsToProps(attrs attribute.Set) map[string]string {
@@ -320,19 +335,15 @@ type appInsightsEnvelope struct {
 }
 
 type appInsightsData struct {
-	BaseType string                `json:"baseType"`
-	BaseData appInsightsMetricData `json:"baseData"`
+	BaseType string               `json:"baseType"`
+	BaseData appInsightsEventData `json:"baseData"`
 }
 
-type appInsightsMetricData struct {
-	Metrics    []appInsightsMetric `json:"metrics"`
-	Properties map[string]string   `json:"properties,omitempty"`
-}
-
-type appInsightsMetric struct {
-	Name  string  `json:"name"`
-	Value float64 `json:"value"`
-	Count int     `json:"count"`
+type appInsightsEventData struct {
+	Version      int                `json:"ver"`
+	Name         string             `json:"name"`
+	Properties   map[string]string  `json:"properties,omitempty"`
+	Measurements map[string]float64 `json:"measurements,omitempty"`
 }
 
 // postEnvelopes sends a batch of telemetry envelopes to the App Insights

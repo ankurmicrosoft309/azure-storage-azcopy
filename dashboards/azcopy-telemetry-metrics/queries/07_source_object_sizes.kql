@@ -1,7 +1,11 @@
 // Visual: Table
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | where name in (
     'azcopy.source_average_object_size_bytes',
     'azcopy.source_object_size_p50_bytes_approx',

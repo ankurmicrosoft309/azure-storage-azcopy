@@ -59,6 +59,7 @@ var LogLevel common.LogLevel
 var CapMbps float64
 var SkipVersionCheck bool
 var disableTelemetry bool
+var telemetrySamplingRate float64
 
 var TrustedSuffixes string
 var azcopyAwaitContinue bool
@@ -73,6 +74,16 @@ var commandsWithJobAttemptTelemetry = map[string]struct{}{
 	"copy":        {},
 	"jobs.resume": {},
 	"sync":        {},
+}
+
+var commandsExcludedFromTelemetry = map[string]struct{}{
+	"__complete":       {},
+	"__completeNoDesc": {},
+	"completion":       {},
+	"doc":              {},
+	"env":              {},
+	"help":             {},
+	"load.clfs":        {},
 }
 
 // telemetryFlagAllowlist contains reviewed flag names whose presence is safe
@@ -104,7 +115,7 @@ var telemetryFlagAllowlist = map[string]struct{}{
 	"s2s-detect-source-changed": {}, "s2s-get-properties-in-backend": {},
 	"s2s-handle-invalid-metadata": {}, "s2s-preserve-access-tier": {},
 	"s2s-preserve-blob-tags": {}, "s2s-preserve-properties": {}, "service-principal": {},
-	"size-per-file": {}, "skip-version-check": {}, "tenant": {}, "trailing-dot": {},
+	"size-per-file": {}, "skip-version-check": {}, "telemetry-sampling-rate": {}, "tenant": {}, "trailing-dot": {},
 	"with-status": {},
 }
 
@@ -298,6 +309,11 @@ func commandUsesJobAttemptTelemetry(command string) bool {
 	return ok
 }
 
+func commandExcludedFromTelemetry(command string) bool {
+	_, ok := commandsExcludedFromTelemetry[command]
+	return ok
+}
+
 func telemetryOptions(cmd *cobra.Command) telemetry.OptionAttributes {
 	if cmd == nil {
 		return telemetry.OptionAttributes{}
@@ -487,10 +503,10 @@ var rootCmd = &cobra.Command{
 			return err
 		}
 		// Transfer job commands emit their own job-attempt start/finish events.
-		// Every other leaf command, including hidden/deprecated commands, emits
-		// one command.invoked event using its canonical full command path.
+		// Other product-operation leaves emit one command.invoked event using
+		// their canonical full command path; tooling-only commands are excluded.
 		command := commandTelemetryName(cmd)
-		if command != "" && !commandUsesJobAttemptTelemetry(command) {
+		if command != "" && !commandUsesJobAttemptTelemetry(command) && !commandExcludedFromTelemetry(command) {
 			azcopy.ReportCommandInvoked(command, Client.CurrentJobID.String(), telemetryOptions(cmd))
 		}
 		return nil
@@ -516,7 +532,13 @@ func Initialize(isMigratedToLibrary, isBench, shouldWarn bool, resumeJobId commo
 	glcm.SetOutputFormat(outputFormat)
 	glcm.SetOutputVerbosity(OutputLevel)
 	jobsAdmin.BenchmarkResults = isBench
-	Client, err = azcopy.NewClient(azcopy.ClientOptions{CapMbps: CapMbps, TrustedSuffixes: TrustedSuffixes, LogLevel: &LogLevel, DisableTelemetry: disableTelemetry})
+	Client, err = azcopy.NewClient(azcopy.ClientOptions{
+		CapMbps:               CapMbps,
+		TrustedSuffixes:       TrustedSuffixes,
+		LogLevel:              &LogLevel,
+		DisableTelemetry:      disableTelemetry,
+		TelemetrySamplingRate: &telemetrySamplingRate,
+	})
 	// Run MessagHandler to process messages from Input Watcher
 	if jobsAdmin.JobsAdmin != nil {
 		go jobsAdmin.JobsAdmin.MessageHandler(glcm.MsgHandlerChannel())
@@ -653,6 +675,9 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&disableTelemetry, "disable-telemetry", false,
 		"Opt out of sending anonymous usage telemetry. Telemetry is enabled by default and contains no PII. "+
 			"\n It can also be disabled by setting the AZCOPY_DISABLE_TELEMETRY environment variable to 'true'.")
+	rootCmd.PersistentFlags().Float64Var(&telemetrySamplingRate, "telemetry-sampling-rate", 0.01,
+		"Diagnostic override for the fraction of job IDs included in anonymous telemetry, from 0.0 through 1.0.")
+	_ = rootCmd.PersistentFlags().MarkHidden("telemetry-sampling-rate")
 }
 
 // always spins up a new goroutine, because sometimes the aka.ms URL can't be reached (e.g. a constrained environment where

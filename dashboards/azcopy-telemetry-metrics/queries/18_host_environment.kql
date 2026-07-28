@@ -1,10 +1,14 @@
 // Visual: Table
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | where name == 'azcopy.job.finished'
 | extend
-    Version = tostring(customDimensions.ServiceVersion),
+    Version = tostring(coalesce(customDimensions.AzCopyVersion, customDimensions.ServiceVersion)),
     SchemaVersion = tostring(customDimensions.SchemaVersion),
     OSType = tostring(customDimensions.OSType),
     OSVersion = tostring(customDimensions.OSVersion),
@@ -13,10 +17,14 @@ customMetrics
     CPUModel = tostring(customDimensions.HostCPUModel),
     MemoryGB = toint(customDimensions.HostMemoryTotalGB),
     NICSpeedBucket = tostring(customDimensions.HostNICSpeedBucket),
-    Virtualization = tostring(customDimensions.HostVirtualization),
-    Region = tostring(customDimensions.GeoRegion),
-    Country = tostring(customDimensions.GeoCountry),
-    NetworkContext = tostring(customDimensions.NetworkRunContext),
+    AzureVMDetectedNew = tostring(customDimensions.AzureVMDetected),
+    CountryOrRegion = tostring(client_CountryOrRegion),
     InvocationContext = tostring(customDimensions.InvocationContext)
-| summarize Attempts = count() by Version, SchemaVersion, OSType, OSVersion, Architecture, CPUCount, CPUModel, MemoryGB, NICSpeedBucket, Virtualization, Region, Country, NetworkContext, InvocationContext
+| extend AzureVMDetected = case(
+    isnotempty(AzureVMDetectedNew), AzureVMDetectedNew,
+    tostring(customDimensions.HostVirtualization) == 'azure-vm' or tostring(customDimensions.NetworkRunContext) == 'azure-vm', 'true',
+    isnotempty(tostring(customDimensions.HostVirtualization)) or isnotempty(tostring(customDimensions.NetworkRunContext)), 'false',
+    'unknown')
+| project-away AzureVMDetectedNew
+| summarize Attempts = count() by Version, SchemaVersion, OSType, OSVersion, Architecture, CPUCount, CPUModel, MemoryGB, NICSpeedBucket, AzureVMDetected, CountryOrRegion, InvocationContext
 | top 100 by Attempts desc

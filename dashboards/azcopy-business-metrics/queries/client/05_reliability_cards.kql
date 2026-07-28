@@ -1,17 +1,21 @@
 // Visual: Multi stat
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | extend
     InvocationID = tostring(customDimensions.InvocationID),
     JobStatusValue = tostring(customDimensions.JobStatus),
-    AttemptTypeValue = tostring(customDimensions.AttemptType),
+    IsResumeValue = tostring(customDimensions.Command) == 'jobs.resume',
     SamplingRateValue = todouble(customDimensions.SamplingRate)
 | where isnotempty(InvocationID) and name != 'azcopy.command.invoked'
 | summarize
     FinishedRows = countif(name == 'azcopy.job.finished'),
     JobStatus = take_anyif(JobStatusValue, isnotempty(JobStatusValue)),
-    AttemptType = take_any(AttemptTypeValue),
+    IsResume = take_any(IsResumeValue),
     SamplingRate = max(SamplingRateValue),
     ObjectsScheduled = maxif(value, name == 'azcopy.objects_scheduled'),
     ObjectsFailed = maxif(value, name == 'azcopy.objects_failed'),
@@ -27,8 +31,8 @@ customMetrics
     EstimatedPartialSuccesses = sumif(Weight, JobStatus == 'CompletedWithErrors'),
     EstimatedFailures = sumif(Weight, JobStatus == 'Failed'),
     EstimatedCancellations = sumif(Weight, JobStatus == 'Cancelled'),
-    EstimatedResumeAttempts = sumif(Weight, AttemptType == 'resume'),
-    EstimatedSuccessfulResumes = sumif(Weight, AttemptType == 'resume' and JobStatus in ('Completed', 'CompletedWithSkipped')),
+    EstimatedResumeAttempts = sumif(Weight, IsResume),
+    EstimatedSuccessfulResumes = sumif(Weight, IsResume and JobStatus in ('Completed', 'CompletedWithSkipped')),
     WeightedObjectsScheduled = sum(Weight * ObjectsScheduled),
     WeightedObjectsFailed = sum(Weight * ObjectsFailed),
     WeightedHttpAttempts = sum(Weight * HttpAttempts),

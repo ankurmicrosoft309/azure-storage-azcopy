@@ -1,12 +1,16 @@
 // Visual: Table or bar chart
 // S2S jobs intentionally appear once per endpoint role; do not sum roles for global totals.
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | extend
     InvocationID = tostring(customDimensions.InvocationID),
-    SourceAccountValue = tostring(customDimensions.SourceStorageAccount),
-    DestAccountValue = tostring(customDimensions.DestStorageAccount),
+    SourceAccountValue = iif(tostring(customDimensions.SourceType) in ('Blob', 'BlobFS', 'File', 'FileNFS'), tostring(customDimensions.SourceStorageAccount), ''),
+    DestAccountValue = iif(tostring(customDimensions.DestType) in ('Blob', 'BlobFS', 'File', 'FileNFS'), tostring(customDimensions.DestStorageAccount), ''),
     SamplingRateValue = todouble(customDimensions.SamplingRate)
 | where isnotempty(InvocationID) and name != 'azcopy.command.invoked'
 | summarize

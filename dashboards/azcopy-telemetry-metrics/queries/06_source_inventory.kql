@@ -1,7 +1,11 @@
 // Visual: Multi stat
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | summarize
     SourceObjectsScanned = sumif(value, name == 'azcopy.source_objects_scanned'),
     SourceBytesScanned = sumif(value, name == 'azcopy.source_bytes_scanned'),
@@ -9,3 +13,8 @@ customMetrics
     ContainersTouched = sumif(value, name == 'azcopy.containers_touched'),
     BucketsScanned = sumif(value, name == 'azcopy.buckets_scanned'),
     BucketsTouched = sumif(value, name == 'azcopy.buckets_touched')
+| project
+    Metrics = pack_array('Source objects scanned', 'Source bytes scanned', 'Containers scanned', 'Containers touched', 'Buckets scanned', 'Buckets touched'),
+    Values = pack_array(SourceObjectsScanned, SourceBytesScanned, ContainersScanned, ContainersTouched, BucketsScanned, BucketsTouched)
+| mv-expand Metric = Metrics to typeof(string), Value = Values to typeof(real)
+| project Metric, Value

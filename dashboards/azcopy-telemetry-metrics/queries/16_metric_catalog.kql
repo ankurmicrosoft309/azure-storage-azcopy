@@ -1,8 +1,12 @@
 // Visual: Table
 // Complete inventory of observed metric names and raw sampled values.
-customMetrics
+customEvents
+| where name startswith 'azcopy.'
+| mv-expand MetricName = bag_keys(customMeasurements)
+| extend name = tostring(MetricName)
+| extend value = todouble(customMeasurements[name])
+| project-away MetricName
 | where timestamp between (_startTime .. _endTime)
-| where tostring(customDimensions.ServiceName) == 'azcopy'
 | summarize
     Samples = count(),
     NonZeroSamples = countif(value != 0),

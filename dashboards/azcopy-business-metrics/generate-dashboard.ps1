@@ -21,8 +21,8 @@ function Read-Query([string]$RelativePath) {
     $text = (Get-Content $path | Where-Object { $_ -notmatch '^\s*//' }) -join "`n"
 
     if ($RelativePath -like "queries/client/*") {
-        $appInsightsTable = "cluster('https://adx.monitor.azure.com/subscriptions/31347be8-d066-464e-9866-7e58d85027b7/resourcegroups/sharankur_playground/providers/microsoft.insights/components/sharankur_insights1').database('sharankur_insights1').customMetrics"
-        $text = [regex]::Replace($text, '(?m)^customMetrics', $appInsightsTable, 1)
+        $appInsightsTable = "cluster('https://adx.monitor.azure.com/subscriptions/31347be8-d066-464e-9866-7e58d85027b7/resourcegroups/sharankur_playground/providers/microsoft.insights/components/sharankur_insights1').database('sharankur_insights1').customEvents"
+        $text = [regex]::Replace($text, '(?m)^customEvents', $appInsightsTable, 1)
     }
 
     if ($RelativePath -eq "queries/server/02_storage_operation_mix.kql") {

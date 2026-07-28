@@ -299,6 +299,7 @@ func (c *Client) Copy(ctx context.Context, src, dest string, opts CopyOptions) (
 		}
 		if telemetryFinalizer != nil {
 			telemetryFinalizer.setFinalSummary(finalSummary)
+			telemetryFinalizer.finish(nil)
 		}
 
 		if common.AzcopyCurrentJobLogger != nil {
