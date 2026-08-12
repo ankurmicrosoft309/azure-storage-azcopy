@@ -109,19 +109,19 @@ With 1% sampling rate, this will be about $4000/month
  
 We can use a single global non-customer-specific subscription in Azure to receive and store the metric data. Seanmcc@microsoft.com is the contact person for this subscription (called Xclient).
 
-Within that subscription we will provision **two Application Insights instances**: one **Test** instance that only receives synthetic telemetry from the E2E pipeline, and one **Prod** instance that receives real (sampled) telemetry from both preview/early-adopter and GA builds. Each instance gets its own connection string, which is embedded into the corresponding AzCopy build, so test telemetry never mixes with real customer telemetry. See [Staging the Application Insights instance (environments)](#staging-the-application-insights-instance-environments) for the detailed rationale and isolation options. 
+Within that subscription we will provision **two Application Insights instances**: one **Test** instance that only receives synthetic telemetry from the E2E pipeline, and one **Prod** instance that receives real (sampled) telemetry from both preview/early-adopter and GA builds. Each instance gets its own connection string. The Prod connection string is embedded into official builds, while the E2E pipeline supplies the Test connection string at runtime, so test telemetry never mixes with real customer telemetry. See [Staging the Application Insights instance (environments)](#staging-the-application-insights-instance-environments) for the detailed rationale and isolation options.
  
 We have to do a privacy review with related teams with PM help and agree that no privacy-sensitive data is saved. 
  
 ### Staging the Application Insights instance (environments) 
 
-Because the App Insights **connection string is embedded in the AzCopy binary** (see Authorization), the telemetry backend is staged primarily by *which connection string a given build embeds*, not by a runtime config. This gives us a clean, low-cost way to separate test traffic from real customer traffic. Recommended approach: 
+Official AzCopy artifacts embed the Prod Application Insights connection string (see Authorization). E2E binaries do not embed the Test connection string; the E2E pipeline retrieves it from ARM and sets `AZCOPY_TELEMETRY_CONNECTION_STRING` for the test process. The existing runtime override takes precedence over an embedded value. This gives us a clean, low-cost way to separate test traffic from real customer traffic without producing a specially linked E2E binary. Recommended approach:
 
 - **Provision two App Insights resources**, each with its own connection string / instrumentation key, both defined in the same Bicep/ARM template and deployed with an environment parameter: 
   - **Test** — target of the E2E pipeline. Receives only synthetic telemetry from automated test runs. Lets us validate ingestion, schema, and dashboards without polluting real data.
   - **Prod** — target of both the **preview/early-adopter** build and the **GA** build. Receives real (sampled) telemetry. The preview build exposure is bounded by the small preview audience plus the 1% sampling rate — and the GA build then ramps the same instance to the full installed base but still with 1% sampling.
 
-Pipeline wiring uses secret variables `AZCOPY_TELEMETRY_CONNECTION_STRING_TEST` for E2E binaries and `AZCOPY_TELEMETRY_CONNECTION_STRING_PROD` for official Linux, Windows, and macOS artifacts. The build templates validate the variable and inject it through Go `-ldflags`. Local builds contain no connection string and keep telemetry disabled unless `AZCOPY_TELEMETRY_CONNECTION_STRING` is explicitly set at runtime. The all-zero placeholder is rejected.
+The E2E pipeline identifies the Test resources with `AZCOPY_TELEMETRY_SUBSCRIPTION_ID_TEST`, `AZCOPY_TELEMETRY_RESOURCE_GROUP_TEST`, and `AZCOPY_TELEMETRY_APP_NAME_TEST`. It retrieves the connection string and Log Analytics workspace customer ID from ARM, then exposes them only to the E2E process as `AZCOPY_TELEMETRY_CONNECTION_STRING` and `NEW_E2E_APP_INSIGHTS_WORKSPACE_ID`. Official Linux, Windows, and macOS build templates continue to inject the Prod connection string through Go `-ldflags`. Local builds contain no connection string and keep telemetry disabled unless `AZCOPY_TELEMETRY_CONNECTION_STRING` is explicitly set at runtime. The all-zero placeholder is rejected.
 
 We can have have separate resource groups but on the same subscription for Test vs Prod (cleaner cost attribution and access control).
 
@@ -133,7 +133,7 @@ The two Application Insights instances are provisioned with a **Bicep template d
 - The repo has **no existing IaC**; all Azure interaction is via ADO pipelines authenticated by **workload-identity service connections** (e.g. `azcopy-release`, `azcopytestworkloadidentity`). This approach follows that established convention. 
 - Provisioning is a **rare, near-one-time** infrastructure task. Putting it in `azure-pipelines.yml` (runs on every PR/push) or `build-1es-pipeline.yaml` (build → sign → publish) would risk accidental re-deploys and couple infra lifecycle to code lifecycle. A separate `trigger: none, pr: none` pipeline (mirroring `e2e-cleanup.yml`) keeps it isolated and explicit. 
 - **Bicep over raw ARM JSON:** Bicep is the modern Azure IaC, compiles to ARM, and is far less verbose for ~2 resources. 
-- **Bicep over EV2:** EV2 (Express v2 / Safe Deployment Practices) is warranted only if the owning team mandates EV2 for all Azure resources, or if multi-region staged rollout with automated health gates is required. For two low-churn App Insights instances it is heavyweight (ServiceModel / RolloutSpec / ScopeBindings, EV2 onboarding, ServiceTree registration). We start with Bicep; if compliance later requires EV2, EV2 can deploy the same Bicep/ARM, so the work is not wasted. **Decision point:** confirm with EM whether the telemetry subscription falls under an EV2/SDP mandate. 
+- **Bicep without EV2:** These are two low-churn, single-region telemetry backends. A manually triggered Azure DevOps pipeline validates, previews, and deploys the Bicep template directly.
 
 ### Azure Monitor OpenTelemetry Exporter 
  
@@ -152,7 +152,7 @@ Authorization to Application Insights can be done in two ways: standard AAD and 
  - Microsoft states the ikey is not a secret/security token; it only routes telemetry to a resource and does not gate who can write 
  - Simplest to deploy: no identity, no role assignment. Works for anonymous/OSS binaries 
 
-The proposed solution is to hardcode/embed the connection string of the environment-appropriate Application Insights resource (**Test** for E2E runs, or **Prod** for preview and GA builds — see [Staging the Application Insights instance](#staging-the-application-insights-instance-environments)) hosted in the XClient subscription into the open-source AzCopy binary and use it to send client-side metrics. Each build embeds the connection string of its corresponding instance. 
+The proposed solution is to hardcode/embed the **Prod** Application Insights connection string hosted in the XClient subscription into preview and GA AzCopy binaries. E2E runs use the same telemetry implementation but override the destination at runtime with the dedicated **Test** connection string retrieved from ARM (see [Staging the Application Insights instance](#staging-the-application-insights-instance-environments)).
  
 The pitfall is that anyone who can extract the connection string will be able to send bogus metrics to Application Insights. However, they will not be able to read any metrics data just based on a connection string.
 
@@ -575,7 +575,7 @@ The following resources will have to be provisioned as part of ADO pipeline asso
 4. Deploy persistent backend (use bicep template)
 • Create the environment-specific resource group.
 • Deploy workspace, App Insights, action group, alerts, workbook, RBAC, budget, and Prod lock.
-• Emit resource IDs and connection string as protected stage outputs.
+• Output resource IDs and the workspace customer ID for deployment validation.
 5. Backend health validation
 • Confirm provisioning state, retention, cap, public ingestion, local-auth settings, and query permissions.
 • Prod stops here; never send synthetic telemetry to Prod.
@@ -583,38 +583,39 @@ The following resources will have to be provisioned as part of ADO pipeline asso
 • Create a run-scoped resource group and storage account/containers.
 • Assign the E2E identity  Storage Blob Data Contributor .
 • Output account/container names to later stages.
-7. Build telemetry-enabled AzCopy
-• Inject the Test connection string using  -ldflags .
-• Set telemetry sampling to 100% for this special E2E build.
-• Hard-fail if the placeholder instrumentation key remains.
+7. Configure and build telemetry-enabled AzCopy
+• Retrieve the Test Application Insights connection string and workspace customer ID from ARM using the E2E workload identity.
+• Verify that the selected Application Insights component is tagged `environment=test`.
+• Export `AZCOPY_TELEMETRY_CONNECTION_STRING`, `NEW_E2E_APP_INSIGHTS_WORKSPACE_ID`, and a unique `AZCOPY_E2E_TELEMETRY_RUN_ID` only to the E2E process.
+• Build the normal E2E binary without telemetry-specific `-ldflags`.
+• The E2E launcher forces the hidden `--telemetry-sampling-rate=1` option while validation is enabled.
 • Release builds separately retrieve and embed the Prod connection string.
 8. Run synthetic scenarios
 • Successful local-to-Blob copy.
 • Successful sync or benchmark smoke test.
 • One controlled terminal failure or cancellation.
-• Capture the AzCopy Job ID from structured output for correlation.
+• Capture every terminal AzCopy Job ID from structured output and count repeated IDs from resume operations.
 9. Validate App Insights ingestion
-• Poll for up to approximately ten minutes to account for ingestion latency.
-• Query `customEvents` / `AppEvents` using the captured `JobID`.
+• During suite teardown, poll for up to five minutes to account for ingestion latency.
+• Acquire a Log Analytics token using the workload identity and query `AppEvents`.
+• Filter by the suite start time, `azcopy.job.finished`, and `E2ETestRunID`; then count events by `JobID`.
 • Assert:
-• One  azcopy.job.started  and one  azcopy.job.finished .
-• Matching  InvocationID .
-• Correct schema/sampler metadata.
-• Expected command, topology, status, bytes and object counts.
-• No SAS, paths, tokens, tenant IDs, or subscription IDs.
-• Publish the query result as pipeline evidence.
+• At least the expected number of terminal `azcopy.job.finished` events arrived for every captured Job ID.
+• Authentication, authorization, malformed query, and malformed response failures fail immediately.
+• Network errors and HTTP 408, 429, 500, 502, 503, and 504 are retried within the bounded polling window.
 10. Teardown
 • Use  condition: always() .
 • Delete only the run-scoped E2E resource group.
 • Support a Storage-Mover-style manual pause to retain failed fixtures temporarily.
 • Never delete the persistent Test/Prod telemetry backends.
 
-Required changes before reliable E2E
+Implemented safeguards for reliable E2E:
 
-- Add a test-build sampling override. The current fixed 1% rate makes a single-job E2E inherently flaky.
-- Wire the App Insights connection string into build and release templates.
-- Add a live ingestion validation script/test with Job-ID correlation.
-- Add a release gate preventing placeholder connection strings.
+- The hidden sampling override is forced to 100% only when live E2E validation is fully configured.
+- Partial configuration fails framework setup rather than silently skipping validation.
+- `E2ETestRunID` is emitted only when explicitly configured and is bounded to the same identifier-size limit as other telemetry dimensions.
+- Query access uses workload identity and least-privilege RBAC. Bicep can optionally assign Log Analytics Reader on the workspace and Reader on the Application Insights component.
+- The persistent Test/Prod telemetry backends are never deleted by run cleanup.
 
 TODOs after MVP:
 - add testing for non azure scenarios as well

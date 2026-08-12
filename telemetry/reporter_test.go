@@ -351,6 +351,25 @@ func TestAttributesIncludeResourceAndDimensions(t *testing.T) {
 	assert.Equal(t, "NetworkErrors,AccountIOPS", attrs["PerformanceAdviceCodes"])
 	_, hasStatus := sampleStarted().attributes()["JobStatus"]
 	assert.False(t, hasStatus)
+	_, hasE2ETestRunID := attrs["E2ETestRunID"]
+	assert.False(t, hasE2ETestRunID)
+}
+
+func TestE2ETestRunIDIsIncludedAndBoundedWhenConfigured(t *testing.T) {
+	event := sampleFinished()
+	event.Resource.E2ETestRunID = strings.Repeat("r", maxIdentifierValueLen+100)
+
+	attrs := event.attributes()
+	assert.Len(t, attrs["E2ETestRunID"], maxIdentifierValueLen)
+	assert.True(t, strings.HasSuffix(attrs["E2ETestRunID"], truncatedPropertyMarker))
+
+	command := CommandInvokedEvent{
+		Resource:     event.Resource,
+		Command:      "jobs.list",
+		Timestamp:    time.Now(),
+		InvokedCount: 1,
+	}
+	assert.Equal(t, attrs["E2ETestRunID"], command.attributes()["E2ETestRunID"])
 }
 
 func TestBenchmarkDimensionsProperties(t *testing.T) {

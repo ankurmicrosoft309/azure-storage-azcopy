@@ -7,9 +7,9 @@
 # Prerequisites (one-time):
 #   - A workload-identity-federated ADO service connection (see serviceConnection
 #     parameter below) with Contributor on the target subscription / resource group.
+#     Role Based Access Control Administrator is also required when this pipeline
+#     creates the optional E2E query role assignments.
 #   - The target subscription id.
-# After a successful run, copy the 'connectionString' deployment output into the
-# matching AzCopy build configuration (test build for E2E, prod build for releases).
 
 trigger: none
 pr: none
@@ -42,6 +42,11 @@ parameters:
     type: string
     default: 'eastus'
 
+  - name: e2eQueryPrincipalId
+    displayName: 'Optional object ID of the E2E workload identity to grant read/query access'
+    type: string
+    default: ''
+
 pool:
   vmImage: 'ubuntu-latest'
 
@@ -55,6 +60,7 @@ steps:
       inlineScript: |
         set -euo pipefail
 
+        az extension add --name log-analytics --yes
         az account set --subscription "${{ parameters.subscriptionId }}"
 
         echo "Ensuring resource group '${{ parameters.resourceGroupName }}' exists in ${{ parameters.location }}"
@@ -63,19 +69,46 @@ steps:
           --location "${{ parameters.location }}" \
           --tags service=azcopy-telemetry managedBy=bicep
 
+        template_file="$(System.DefaultWorkingDirectory)/infra/telemetry/main.bicep"
+        parameters_file="$(System.DefaultWorkingDirectory)/infra/telemetry/${{ parameters.environmentName }}.bicepparam"
+        query_principal="${{ parameters.e2eQueryPrincipalId }}"
+
+        echo "Compiling telemetry Bicep"
+        az bicep build --file "$template_file" --stdout >/dev/null
+
+        echo "Validating telemetry deployment"
+        az deployment group validate \
+          --resource-group "${{ parameters.resourceGroupName }}" \
+          --template-file "$template_file" \
+          --parameters "$parameters_file" \
+          e2eQueryPrincipalId="$query_principal" \
+          --output none
+
+        echo "Previewing telemetry deployment changes"
+        az deployment group what-if \
+          --resource-group "${{ parameters.resourceGroupName }}" \
+          --template-file "$template_file" \
+          --parameters "$parameters_file" \
+          e2eQueryPrincipalId="$query_principal"
+
         echo "Deploying telemetry backend (environment=${{ parameters.environmentName }})"
         az deployment group create \
           --resource-group "${{ parameters.resourceGroupName }}" \
           --name "azcopy-telemetry-${{ parameters.environmentName }}" \
-          --template-file "$(System.DefaultWorkingDirectory)/infra/telemetry/main.bicep" \
-          --parameters "$(System.DefaultWorkingDirectory)/infra/telemetry/${{ parameters.environmentName }}.bicepparam"
+          --template-file "$template_file" \
+          --parameters "$parameters_file" \
+          e2eQueryPrincipalId="$query_principal" \
+          --output none
 
-        # The connection string is needed to embed into the matching AzCopy build.
-        # It routes telemetry only and is not a secret, but we mark it as a secret
-        # variable here to keep it out of plain build logs by default.
-        connStr=$(az deployment group show \
+        workspace_customer_id=$(az deployment group show \
           --resource-group "${{ parameters.resourceGroupName }}" \
           --name "azcopy-telemetry-${{ parameters.environmentName }}" \
-          --query properties.outputs.connectionString.value -o tsv)
-        echo "##vso[task.setvariable variable=telemetryConnectionString;issecret=true]$connStr"
-        echo "Provisioned. Connection string captured in pipeline variable 'telemetryConnectionString'."
+          --query properties.outputs.workspaceCustomerId.value -o tsv)
+
+        echo "Running Log Analytics smoke query"
+        az monitor log-analytics query \
+          --workspace "$workspace_customer_id" \
+          --analytics-query 'print SmokeTest=1' \
+          --output none
+
+        echo "Provisioned and verified telemetry backend."

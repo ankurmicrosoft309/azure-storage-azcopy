@@ -71,6 +71,9 @@ const (
 	envTelemetryConnectionString = "AZCOPY_TELEMETRY_CONNECTION_STRING"
 	// envDisableTelemetry, when set to "true", disables telemetry entirely.
 	envDisableTelemetry = "AZCOPY_DISABLE_TELEMETRY"
+	// envE2ETelemetryRunID optionally correlates telemetry emitted by one E2E
+	// pipeline matrix leg. It is unset in normal AzCopy usage.
+	envE2ETelemetryRunID = "AZCOPY_E2E_TELEMETRY_RUN_ID"
 	// telemetrySendTimeout bounds how long a single send may block.
 	telemetrySendTimeout = 5 * time.Second
 	// installationIDFileName stores the anonymous, per-install identifier.
@@ -441,6 +444,7 @@ func buildResourceAttributes() telemetry.ResourceAttributes {
 		SchemaVersion:      telemetrySchemaVersion,
 		SamplingRate:       telemetrySamplingRate,
 		SamplerVersion:     telemetrySamplerVersion,
+		E2ETestRunID:       strings.TrimSpace(os.Getenv(envE2ETelemetryRunID)),
 		OSType:             runtime.GOOS,
 		OSVersion:          hw.osVersion,
 		HostArch:           runtime.GOARCH,

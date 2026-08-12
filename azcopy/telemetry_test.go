@@ -568,6 +568,14 @@ func TestBuildResourceAttributesSamplingMetadata(t *testing.T) {
 	assert.Equal(t, telemetrySamplerVersion, resource.SamplerVersion)
 }
 
+func TestBuildResourceAttributesE2ETestRunID(t *testing.T) {
+	t.Setenv(envE2ETelemetryRunID, "pipeline-run-123")
+	assert.Equal(t, "pipeline-run-123", buildResourceAttributes().E2ETestRunID)
+
+	t.Setenv(envE2ETelemetryRunID, "   ")
+	assert.Empty(t, buildResourceAttributes().E2ETestRunID)
+}
+
 func TestConfigureTelemetrySamplingRate(t *testing.T) {
 	original := telemetrySamplingRate
 	t.Cleanup(func() { telemetrySamplingRate = original })
