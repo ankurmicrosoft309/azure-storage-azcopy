@@ -4,7 +4,7 @@
 
 Validate, as part of the existing AzCopy end-to-end test run, that job telemetry emitted by the test AzCopy process reaches a dedicated Application Insights resource. The validation must use a runtime connection-string override so the E2E binary is not linked to either the production or test telemetry resource.
 
-EV2 is intentionally not part of this design. The test resource is provisioned with Bicep and deployed through Azure Pipelines.
+EV2 is intentionally not part of this design. The persistent test resource is provisioned with Bicep independently of the E2E pipeline.
 
 ## Architecture
 
@@ -98,7 +98,7 @@ The connection string is not stored as an output variable or secret. The E2E pip
 - Run AzCopy telemetry tests.
 - Run E2E package tests that cover the verifier and command construction.
 - Compile Bicep and validate pipeline YAML through the repository's existing checks where available.
-- In the dedicated subscription, deploy the infrastructure pipeline and run one E2E matrix leg before enabling all legs.
+- In the dedicated subscription, deploy the Bicep infrastructure and run one E2E matrix leg before enabling all legs.
 
 ## Rollout
 
@@ -117,4 +117,3 @@ The connection string is not stored as an output variable or secret. The E2E pip
 - Application Insights component name.
 - Object ID of the E2E workload identity if Bicep should manage query RBAC.
 - Confirmation that the E2E Azure service connection can read the component and obtain a Log Analytics query token in the dedicated subscription.
-
