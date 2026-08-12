@@ -82,5 +82,5 @@ func TestTransferScheduledObserver(t *testing.T) {
 	assert.NoError(t, processor.ScheduleSyncRemoveSetPropertiesTransfer(file))
 	assert.NoError(t, processor.ScheduleSyncRemoveSetPropertiesTransfer(folder))
 	assert.Equal(t, []traverser.StoredObject{file}, scheduled)
-	assert.Len(t, processor.CopyJobTemplate.Transfers.List, 1)
+	assert.Len(t, processor.dispatcher.PendingTransfers.List, 1)
 }

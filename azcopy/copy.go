@@ -207,7 +207,7 @@ func (c *Client) Copy(ctx context.Context, src, dest string, opts CopyOptions) (
 	}
 
 	ctx = context.WithValue(ctx, ste.ServiceAPIVersionOverride, ste.DefaultServiceApiVersion)
-	t, err = newCopyTransferExecutor(ctx, jobID, src, dest, opts, c.GetUserOAuthTokenManagerInstance())
+	t, err := newCopyTransferExecutor(ctx, jobID, src, dest, opts, c.GetUserOAuthTokenManagerInstance())
 	if err != nil {
 		return CopyResult{}, err
 	}
