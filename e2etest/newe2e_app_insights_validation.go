@@ -401,11 +401,11 @@ func parseJSONInt(value json.RawMessage) (int, error) {
 	if err := json.Unmarshal(value, &number); err != nil {
 		return 0, err
 	}
-	parsed, err := strconv.ParseInt(number.String(), 10, 64)
+	parsed, err := strconv.Atoi(number.String())
 	if err != nil {
 		return 0, err
 	}
-	return int(parsed), nil
+	return parsed, nil
 }
 
 type retryableQueryError struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -98,6 +99,16 @@ func TestParseFinishedEventCountsUsesColumnNames(t *testing.T) {
 	counts, err := parseFinishedEventCounts(result)
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int{"job-1": 2, "job-2": 1}, counts)
+}
+
+func TestParseJSONIntRejectsOverflow(t *testing.T) {
+	overflow := "2147483648"
+	if strconv.IntSize == 64 {
+		overflow = "9223372036854775808"
+	}
+
+	_, err := parseJSONInt(json.RawMessage(overflow))
+	require.Error(t, err)
 }
 
 type stubFinishedEventQueryClient struct {
