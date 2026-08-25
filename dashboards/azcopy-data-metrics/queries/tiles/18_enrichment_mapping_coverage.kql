@@ -1,0 +1,24 @@
+// Visual: Table
+let QueryStart = _startTime;
+let QueryEnd = _endTime;
+{{ENRICHED_FINISHED_JOBS}}
+{{ENRICHMENT_FILTERS}}
+let AccountCoverage = FilteredFinishedJobs
+    | summarize EstimatedJobs = sum(Weight), EstimatedBytes = sum(Weight * BytesTransferred)
+      by Status = AccountInventoryStatus
+    | extend Inventory = 'Historical account inventory';
+let ResourceCoverage = FilteredFinishedJobs
+    | summarize EstimatedJobs = sum(Weight), EstimatedBytes = sum(Weight * BytesTransferred)
+      by Status = ResourceInventoryStatus
+    | extend Inventory = 'Current ARM resource inventory';
+let SubscriptionCoverage = FilteredFinishedJobs
+    | summarize EstimatedJobs = sum(Weight), EstimatedBytes = sum(Weight * BytesTransferred)
+      by Status = SubscriptionInventoryStatus
+    | extend Inventory = 'Current subscription inventory';
+union AccountCoverage, ResourceCoverage, SubscriptionCoverage
+| project
+    Inventory,
+    Status,
+    EstimatedJobs = round(EstimatedJobs, 0),
+    EstimatedDataTB = round(EstimatedBytes / 1000000000000.0, 3)
+| order by Inventory asc, EstimatedJobs desc

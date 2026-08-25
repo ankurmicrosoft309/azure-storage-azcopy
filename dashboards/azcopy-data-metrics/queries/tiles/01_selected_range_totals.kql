@@ -1,0 +1,14 @@
+// Visual: Multi-stat
+let QueryStart = _startTime;
+let QueryEnd = _endTime;
+{{ENRICHED_FINISHED_JOBS}}
+{{ENRICHMENT_FILTERS}}
+FilteredFinishedJobs
+| summarize
+    EstimatedJobs = sum(Weight),
+    EstimatedObjects = sum(Weight * ObjectsCompleted),
+    EstimatedBytes = sum(Weight * BytesTransferred)
+| project
+    EstimatedJobs = round(EstimatedJobs, 0),
+    EstimatedCompletedObjects = round(EstimatedObjects, 0),
+    EstimatedDataTB = round(EstimatedBytes / 1000000000000.0, 3)

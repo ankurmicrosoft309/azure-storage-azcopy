@@ -1,0 +1,24 @@
+// Visual: Table
+let CurrentMonthStart = startofmonth(now());
+let PreviousMonthStart = startofmonth(CurrentMonthStart - 1d);
+let QueryStart = PreviousMonthStart;
+let QueryEnd = now();
+{{ENRICHED_FINISHED_JOBS}}
+{{ENRICHMENT_FILTERS}}
+FilteredFinishedJobs
+| extend Month = case(
+    EndTime >= CurrentMonthStart, 'Current month',
+    EndTime >= PreviousMonthStart and EndTime < CurrentMonthStart, 'Previous month',
+    'Outside comparison')
+| where Month != 'Outside comparison'
+| summarize
+    EstimatedJobs = sum(Weight),
+    EstimatedObjects = sum(Weight * ObjectsCompleted),
+    EstimatedBytes = sum(Weight * BytesTransferred)
+  by Month
+| project
+    Month,
+    EstimatedJobs = round(EstimatedJobs, 0),
+    EstimatedCompletedObjects = round(EstimatedObjects, 0),
+    EstimatedDataTB = round(EstimatedBytes / 1000000000000.0, 3)
+| order by Month asc
