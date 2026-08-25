@@ -1,13 +1,3 @@
-parameters:
-  - name: pipelineMode
-    displayName: 'Pipeline mode'
-    type: string
-    default: Tests
-    values:
-      - Tests
-      - ValidateTelemetryInfrastructure
-      - DeployTelemetryInfrastructure
-
 variables:
   AZCOPY_GOLANG_VERSION: '1.25.11'
   AZCOPY_GOLANG_VERSION_COVERAGE: '1.25.11'
@@ -21,18 +11,7 @@ pr:
     include: [ '*' ]
 
 stages:
-  - ${{ if eq(parameters.pipelineMode, 'Tests') }}:
-    - stage: Tests
-      displayName: 'Build and test AzCopy'
-      jobs:
-        - template: azurePipelineTemplates/test-jobs.yml
-
-  - ${{ if eq(parameters.pipelineMode, 'ValidateTelemetryInfrastructure') }}:
-    - template: azurePipelineTemplates/telemetry-infrastructure-stages.yml
-      parameters:
-        action: Validate
-
-  - ${{ if eq(parameters.pipelineMode, 'DeployTelemetryInfrastructure') }}:
-    - template: azurePipelineTemplates/telemetry-infrastructure-stages.yml
-      parameters:
-        action: Deploy
+  - stage: Tests
+    displayName: 'Build and test AzCopy'
+    jobs:
+      - template: azurePipelineTemplates/test-jobs.yml
