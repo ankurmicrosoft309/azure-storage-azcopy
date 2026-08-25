@@ -15,7 +15,20 @@ let SubscriptionCoverage = FilteredFinishedJobs
     | summarize EstimatedJobs = sum(Weight), EstimatedBytes = sum(Weight * BytesTransferred)
       by Status = SubscriptionInventoryStatus
     | extend Inventory = 'Current subscription inventory';
-union AccountCoverage, ResourceCoverage, SubscriptionCoverage
+let AipddSubscriptionCoverage = FilteredFinishedJobs
+    | summarize EstimatedJobs = sum(Weight), EstimatedBytes = sum(Weight * BytesTransferred)
+      by Status = AipddSubscriptionInventoryStatus
+    | extend Inventory = 'AIPDD subscription inventory';
+let CustomerCoverage = FilteredFinishedJobs
+    | summarize EstimatedJobs = sum(Weight), EstimatedBytes = sum(Weight * BytesTransferred)
+      by Status = CustomerInventoryStatus
+    | extend Inventory = 'AIPDD top-parent customer inventory';
+union
+    AccountCoverage,
+    ResourceCoverage,
+    SubscriptionCoverage,
+    AipddSubscriptionCoverage,
+    CustomerCoverage
 | project
     Inventory,
     Status,

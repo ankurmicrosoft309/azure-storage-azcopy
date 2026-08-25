@@ -3,7 +3,8 @@ param(
     [string]$AppInsightsResourceId = "/subscriptions/31347be8-d066-464e-9866-7e58d85027b7/resourceGroups/sharankur_playground/providers/Microsoft.Insights/components/sharankur_insights1",
     [string]$AppInsightsDatabase = "sharankur_insights1",
     [string]$OutputSuffix = "",
-    [switch]$EnableLiveArgEnrichment = $true
+    [switch]$EnableLiveArgEnrichment = $true,
+    [switch]$EnableAipddEnrichment = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,14 +38,21 @@ function Get-AppInsightsExpression {
     return "cluster('https://adx.monitor.azure.com/$resourceId').database('$AppInsightsDatabase').customEvents"
 }
 
-function Get-EnrichedJobsText {
+function Get-EnrichedJobsText([bool]$UseAipddEnrichment) {
     $text = Get-Content -Raw (Join-Path $dataRoot "queries\common\enriched_finished_jobs.kql")
+    $aipddSource = if ($EnableAipddEnrichment -and $UseAipddEnrichment) {
+        "cluster('https://aipddprod.kusto.windows.net').database('AIPDD_Usage').SubscriptionSnapshotV2"
+    } else {
+        "datatable(SubscriptionGuid:string, FriendlySubscriptionName:string, AI_OfferType:string, TPID:string, TPName:string, CurrentSubscriptionStatus:string, AI_SubscriptionBusinessStatus:string, AI_UpdatedAt:datetime)[]"
+    }
     return $text.
         Replace("__APP_INSIGHTS_CUSTOM_EVENTS__", (Get-AppInsightsExpression)).
         Replace("__XSTORE_ACCOUNT_PROPERTIES__", "cluster('https://xdataanalytics.westcentralus.kusto.windows.net').database('XDataAnalytics').XStoreAccountPropertiesDaily").
+        Replace("__AIPDD_SUBSCRIPTION_SNAPSHOT__", $aipddSource).
         Replace("__ARG_RESOURCES__", "cluster('https://argeusarm1pone.eastus.kusto.windows.net').database('AzureResourceGraph').Resources").
         Replace("__ARG_SUBSCRIPTIONS__", "cluster('https://argeusarm1pone.eastus.kusto.windows.net').database('AzureResourceGraph').InternalSubscriptionResources").
-        Replace("__ENABLE_LIVE_ARG_ENRICHMENT__", $(if ($EnableLiveArgEnrichment) { "true" } else { "false" }))
+        Replace("__ENABLE_LIVE_ARG_ENRICHMENT__", $(if ($EnableLiveArgEnrichment) { "true" } else { "false" })).
+        Replace("__ENABLE_AIPDD_ENRICHMENT__", $(if ($EnableAipddEnrichment -and $UseAipddEnrichment) { "true" } else { "false" }))
 }
 
 $adxAdaptationFilters = @'
@@ -58,6 +66,7 @@ let FilteredJobs = materialize(
     | where SourceType in (_sourceType) or isempty(_sourceType)
     | where DestType in (_destType) or isempty(_destType)
     | where SubscriptionScope in (_subscriptionScope) or isempty(_subscriptionScope)
+    {{CUSTOMER_FILTER}}
 );
 '@
 
@@ -72,14 +81,28 @@ let FilteredJobs = materialize(
     | where $__contains(SourceType, ${SourceType})
     | where $__contains(DestType, ${DestType})
     | where $__contains(SubscriptionScope, ${SubscriptionScope})
+    {{CUSTOMER_FILTER}}
 );
 '@
 
-function Expand-Query([string]$Text, [ValidateSet("adx", "grafana")] [string]$Target) {
+function Expand-Query(
+    [string]$Text,
+    [ValidateSet("adx", "grafana")] [string]$Target,
+    [bool]$UseAipddEnrichment = $false
+) {
+    $adaptationFilters = if ($Target -eq "adx") {
+        $adxAdaptationFilters.Replace(
+            "{{CUSTOMER_FILTER}}",
+            $(if ($UseAipddEnrichment) { "| where CustomerKey in (_customer) or isempty(_customer)" } else { "" }))
+    } else {
+        $grafanaAdaptationFilters.Replace(
+            "{{CUSTOMER_FILTER}}",
+            $(if ($UseAipddEnrichment) { '| where $__contains(CustomerKey, ${Customer})' } else { "" }))
+    }
     $query = $Text.
         Replace("__APP_INSIGHTS_CUSTOM_EVENTS__", (Get-AppInsightsExpression)).
-        Replace("{{ENRICHED_FINISHED_JOBS}}", (Get-EnrichedJobsText)).
-        Replace("{{ADAPTATION_FILTERS}}", $(if ($Target -eq "adx") { $adxAdaptationFilters } else { $grafanaAdaptationFilters }))
+        Replace("{{ENRICHED_FINISHED_JOBS}}", (Get-EnrichedJobsText $UseAipddEnrichment)).
+        Replace("{{ADAPTATION_FILTERS}}", $adaptationFilters)
 
     if ($Target -eq "grafana") {
         $query = $query.
@@ -94,7 +117,7 @@ function Expand-DataQuery([string]$Path, [ValidateSet("adx", "grafana")] [string
     $text = Get-Content -Raw (Join-Path $dataRoot $Path)
     $usesSharedProjection = $text.Contains("{{ENRICHED_FINISHED_JOBS}}")
     $text = $text.
-        Replace("{{ENRICHED_FINISHED_JOBS}}", (Get-EnrichedJobsText)).
+        Replace("{{ENRICHED_FINISHED_JOBS}}", (Get-EnrichedJobsText $true)).
         Replace("{{ENRICHMENT_FILTERS}}", (Get-Content -Raw (Join-Path $dataRoot "queries\common\enrichment_filters.kql")))
     if (-not $usesSharedProjection) {
         $text = $text.Replace("customEvents", (Get-AppInsightsExpression))
@@ -111,6 +134,7 @@ let FilteredFinishedJobs = materialize(
     | where $__contains(DestEndpointKind, ${DestEndpointKind})
     | where $__contains(ClientRegion, ${ClientRegion})
     | where $__contains(DestinationSubscriptionKey, ${DestinationSubscription})
+    | where $__contains(CustomerKey, ${Customer})
     | where $__contains(OfferType, ${OfferType})
     | where $__contains(SubscriptionScope, ${SubscriptionScope})
     | where isempty('${Account}')
@@ -180,7 +204,7 @@ function New-GrafanaTarget([string]$Query, [string]$Format = "table") {
     }
 }
 
-function New-GrafanaPanel([hashtable]$Definition, [int]$Id) {
+function New-GrafanaPanel([hashtable]$Definition, [int]$Id, [bool]$UseAipddEnrichment = $false) {
     $type = switch ($Definition.Visual) {
         "multistat" { "stat" }
         "timechart" { "timeseries" }
@@ -224,7 +248,7 @@ function New-GrafanaPanel([hashtable]$Definition, [int]$Id) {
     }
 
     $format = if ($type -eq "timeseries") { "time_series" } else { "table" }
-    $panel.targets = @(New-GrafanaTarget (Expand-Query $Definition.Query "grafana") $format)
+    $panel.targets = @(New-GrafanaTarget (Expand-Query $Definition.Query "grafana" $UseAipddEnrichment) $format)
 
     switch ($type) {
         "stat" {
@@ -349,24 +373,41 @@ function New-AdxVisualOptions([string]$Visual) {
     }
 }
 
-function Get-AdaptationParameterQueries([ValidateSet("adx", "grafana")] [string]$Target) {
+function Get-AdaptationParameterQueries(
+    [ValidateSet("adx", "grafana")] [string]$Target,
+    [bool]$UseAipddEnrichment
+) {
     $queries = [ordered]@{}
-    foreach ($definition in @(
+    $definitions = @(
         @{ Name = "InvocationContext"; Column = "InvocationContext" },
         @{ Name = "SourceType"; Column = "SourceType" },
         @{ Name = "DestType"; Column = "DestType" },
         @{ Name = "SubscriptionScope"; Column = "SubscriptionScope" }
-    )) {
+    )
+    if ($UseAipddEnrichment) {
+        $definitions += @{ Name = "Customer"; Column = "CustomerKey" }
+    }
+    foreach ($definition in $definitions) {
+        $projection = if ($definition.Name -eq "Customer") {
+            @"
+| where CustomerInventoryStatus == 'Mapped'
+| summarize Label = any(CustomerName) by Value = CustomerKey
+"@
+        } else {
+            @"
+| distinct Value = $($definition.Column)
+| project Value, Label = Value
+"@
+        }
         $text = @"
 let QueryStart = $(if ($Target -eq "adx") { "_startTime" } else { 'datetime(${__from:date})' });
 let QueryEnd = $(if ($Target -eq "adx") { "_endTime" } else { 'datetime(${__to:date})' });
 {{ENRICHED_FINISHED_JOBS}}
 EnrichedFinishedJobs
-| distinct Value = $($definition.Column)
-| project Value, Label = Value
+$projection
 | order by Label asc
 "@
-        $queries[$definition.Name] = Expand-Query $text $Target
+        $queries[$definition.Name] = Expand-Query $text $Target $UseAipddEnrichment
     }
     return $queries
 }
@@ -378,7 +419,8 @@ function New-AdxDashboard([hashtable]$Definition) {
     $queries = @()
     $tiles = @()
 
-    $parameterQueries = Get-AdaptationParameterQueries "adx"
+    $useAipddEnrichment = [bool]$Definition.EnableCustomerEnrichment
+    $parameterQueries = Get-AdaptationParameterQueries "adx" $useAipddEnrichment
     $parameters = @(
         [ordered]@{
             kind = "duration"
@@ -390,12 +432,16 @@ function New-AdxDashboard([hashtable]$Definition) {
             showOnPages = [ordered]@{ kind = "all" }
         }
     )
-    foreach ($variable in @(
+    $queryVariables = @(
         @{ Name = "InvocationContext"; Variable = "_invocationContext"; Label = "Invocation context" },
         @{ Name = "SourceType"; Variable = "_sourceType"; Label = "Source type" },
         @{ Name = "DestType"; Variable = "_destType"; Label = "Destination type" },
         @{ Name = "SubscriptionScope"; Variable = "_subscriptionScope"; Label = "Destination subscription scope" }
-    )) {
+    )
+    if ($useAipddEnrichment) {
+        $queryVariables += @{ Name = "Customer"; Variable = "_customer"; Label = "Customer" }
+    }
+    foreach ($variable in $queryVariables) {
         $queryId = New-StableGuid "${prefix}:parameter-query:$($variable.Name)"
         $queries += [ordered]@{
             dataSource = [ordered]@{ kind = "inline"; dataSourceId = $dataSourceId }
@@ -452,9 +498,18 @@ function New-AdxDashboard([hashtable]$Definition) {
             $queryId = New-StableGuid "${prefix}:query:${index}:$($item.Title)"
             $queries += [ordered]@{
                 dataSource = [ordered]@{ kind = "inline"; dataSourceId = $dataSourceId }
-                text = Expand-Query $item.Query "adx"
+                text = Expand-Query $item.Query "adx" $useAipddEnrichment
                 id = $queryId
-                usedVariables = @("_startTime", "_endTime", "_installationID", "_account", "_invocationContext", "_sourceType", "_destType", "_subscriptionScope")
+                usedVariables = @(
+                    "_startTime",
+                    "_endTime",
+                    "_installationID",
+                    "_account",
+                    "_invocationContext",
+                    "_sourceType",
+                    "_destType",
+                    "_subscriptionScope"
+                ) + $(if ($useAipddEnrichment) { @("_customer") } else { @() })
             }
             $tile.queryRef = [ordered]@{ kind = "query"; queryId = $queryId }
             $tile.visualOptions = New-AdxVisualOptions $item.Visual
@@ -489,7 +544,8 @@ function New-AdxDashboard([hashtable]$Definition) {
 }
 
 function New-GrafanaDashboard([hashtable]$Definition) {
-    $parameterQueries = Get-AdaptationParameterQueries "grafana"
+    $useAipddEnrichment = [bool]$Definition.EnableCustomerEnrichment
+    $parameterQueries = Get-AdaptationParameterQueries "grafana" $useAipddEnrichment
     $variables = @(
         (New-TextVariable "InstallationID" "Installation ID"),
         (New-TextVariable "Account" "Storage account"),
@@ -498,9 +554,12 @@ function New-GrafanaDashboard([hashtable]$Definition) {
         (New-QueryVariable "DestType" "Destination type" $parameterQueries.DestType),
         (New-QueryVariable "SubscriptionScope" "Destination subscription scope" $parameterQueries.SubscriptionScope)
     )
+    if ($useAipddEnrichment) {
+        $variables += New-QueryVariable "Customer" "Customer" $parameterQueries.Customer
+    }
     $panels = @()
     for ($i = 0; $i -lt $Definition.Panels.Count; $i++) {
-        $panels += New-GrafanaPanel $Definition.Panels[$i] ($i + 1)
+        $panels += New-GrafanaPanel $Definition.Panels[$i] ($i + 1) $useAipddEnrichment
     }
     $dashboard = [ordered]@{
         uid = $Definition.Uid
@@ -572,12 +631,13 @@ $definitions = @(
         Name = "azcopy-customer-drilldown"
         Uid = "azcopy-customer-drilldown"
         Title = "AzCopy Customer Drilldown"
-        Description = "Selected-range drilldown by pseudonymous installation ID or Storage account proxy."
+        Description = "Selected-range drilldown by approved server-side customer enrichment, pseudonymous installation ID, or Storage account."
+        EnableCustomerEnrichment = $true
         Panels = @(
             @{
                 Title = "How to read this dashboard"; Visual = "markdownCard"; Description = ""
                 X = 0; Y = 0; W = 22; H = 5
-                MarkdownText = "InstallationID is a pseudonymous observed installation, not a verified customer or tenant. Storage account is a resource proxy. All results are limited to the selected time range and deduplicate resumed terminal events by JobID."
+                MarkdownText = "Customer names come from the approved AIPDD SubscriptionSnapshotV2 top-parent mapping after AzCopy-observed destination accounts resolve to subscriptions. The TPID is used only as the server-side filter key and is not shown as a label. Missing customer mappings remain explicit. InstallationID is pseudonymous and results are limited to the selected time range."
             },
             @{
                 Title = "Selected installation/account summary"; Visual = "multistat"; Description = "Observed entities and inverse-sampling estimates after all filters."
@@ -658,7 +718,7 @@ FilteredJobs
     ObservedJobs = dcount(JobID),
     EstimatedDataTB = round(sum(Weight * BytesTransferred) / 1e12, 3),
     LastObserved = max(EndTime)
-  by DestinationAccount, DestinationSubscription, OfferType, SubscriptionScope, StorageRegion, StorageKind, StorageSku, StorageRedundancy, StorageNamespace
+  by DestinationAccount, CustomerName, CustomerInventoryStatus, DestinationSubscription, OfferType, SubscriptionScope, StorageRegion, StorageKind, StorageSku, StorageRedundancy, StorageNamespace
 | top 100 by EstimatedDataTB desc
 '@
             },
@@ -670,7 +730,7 @@ let QueryEnd = _endTime;
 {{ENRICHED_FINISHED_JOBS}}
 {{ADAPTATION_FILTERS}}
 FilteredJobs
-| project EndTime, InstallationID, JobID, Command, FromTo, SourceAccount, DestinationAccount, JobStatus, JobErrorCategory, JobErrorCode, BytesTransferred, ObjectsCompleted, ObjectsFailed, JobDurationSeconds, JobThroughputMbps
+| project EndTime, InstallationID, JobID, Command, FromTo, SourceAccount, DestinationAccount, CustomerName, CustomerInventoryStatus, DestinationSubscription, OfferType, JobStatus, JobErrorCategory, JobErrorCode, BytesTransferred, ObjectsCompleted, ObjectsFailed, JobDurationSeconds, JobThroughputMbps
 | top 200 by EndTime desc
 '@
             }
@@ -772,11 +832,12 @@ EnrichedFinishedJobs
         Uid = "azcopy-no-observed-success"
         Title = "AzCopy Installations and Accounts with No Observed Success"
         Description = "Selected-range terminal failures without a successful terminal job."
+        EnableCustomerEnrichment = $true
         Panels = @(
             @{
                 Title = "How to read this dashboard"; Visual = "markdownCard"; Description = ""
                 X = 0; Y = 0; W = 22; H = 5
-                MarkdownText = "No observed success means at least one terminal job and no successful terminal job in the selected range after filters. It does not prove lifetime failure. InstallationID is pseudonymous; destination Storage accounts are resource proxies."
+                MarkdownText = "No observed success means at least one terminal job and no successful terminal job in the selected range after filters. It does not prove lifetime failure. Customer names use approved server-side AIPDD top-parent mappings; missing mappings remain explicit. InstallationID is pseudonymous."
             },
             @{
                 Title = "Selected-range no-success summary"; Visual = "multistat"; Description = "Observed installations, destination accounts, terminal jobs, and failures in the no-success populations."
@@ -841,9 +902,9 @@ FilteredJobs
     SuccessJobs = dcountif(JobID, JobStatus =~ 'Completed' and TransfersFailed == 0),
     FailedJobs = dcountif(JobID, JobStatus !~ 'Completed' or TransfersFailed > 0),
     arg_max(EndTime, JobErrorCode)
-  by DestinationAccount, DestinationSubscription, OfferType, SubscriptionScope, StorageKind, StorageSku, StorageRedundancy
+  by DestinationAccount, CustomerName, CustomerInventoryStatus, DestinationSubscription, OfferType, SubscriptionScope, StorageKind, StorageSku, StorageRedundancy
 | where SuccessJobs == 0 and TerminalJobs > 0
-| project DestinationAccount, DestinationSubscription, OfferType, SubscriptionScope, StorageKind, StorageSku, StorageRedundancy, FirstObserved, LastObserved, TerminalJobs, FailedJobs, LatestErrorCode = JobErrorCode
+| project DestinationAccount, CustomerName, CustomerInventoryStatus, DestinationSubscription, OfferType, SubscriptionScope, StorageKind, StorageSku, StorageRedundancy, FirstObserved, LastObserved, TerminalJobs, FailedJobs, LatestErrorCode = JobErrorCode
 | top 500 by FailedJobs desc
 '@
             },
@@ -877,7 +938,7 @@ let NoSuccess = FilteredJobs
 FilteredJobs
 | join kind=inner NoSuccess on InstallationID
 | where JobStatus !~ 'Completed' or TransfersFailed > 0
-| project EndTime, InstallationID, JobID, FromTo, DestinationAccount, JobStatus, JobErrorCategory, JobErrorCode, TransfersFailed, ObjectsFailed, BytesTransferred
+| project EndTime, InstallationID, JobID, FromTo, DestinationAccount, CustomerName, CustomerInventoryStatus, DestinationSubscription, JobStatus, JobErrorCategory, JobErrorCode, TransfersFailed, ObjectsFailed, BytesTransferred
 | top 300 by EndTime desc
 '@
             }
@@ -1001,7 +1062,7 @@ foreach ($definition in $definitions) {
 }
 
 $dataManifest = @(
-    @{ Title = "How to read this dashboard"; Visual = "markdownCard"; Description = ""; X = 0; Y = 0; W = 22; H = 5; MarkdownText = "AzCopy logical payload and object metrics with inverse SamplingRate estimates. Destination account names are enriched server-side with historical XStore account properties and current Azure Resource Graph metadata. Unmapped resources remain explicit." },
+    @{ Title = "How to read this dashboard"; Visual = "markdownCard"; Description = ""; X = 0; Y = 0; W = 22; H = 5; MarkdownText = "AzCopy logical payload and object metrics with inverse SamplingRate estimates. Destination accounts are enriched server-side with historical XStore properties, current Azure Resource Graph metadata, and approved AIPDD subscription/customer dimensions. Unmapped resources and customers remain explicit." },
     @{ Title = "Selected-range data totals"; Path = "queries\tiles\01_selected_range_totals.kql"; Visual = "multistat"; Description = "Observed jobs and estimated payload totals."; X = 0; Y = 5; W = 22; H = 6 },
     @{ Title = "Current versus previous month"; Path = "queries\tiles\02_current_previous_month.kql"; Visual = "multistat"; Description = "Calendar-month comparison."; X = 0; Y = 11; W = 22; H = 6 },
     @{ Title = "Monthly estimated data transferred"; Path = "queries\tiles\03_monthly_data_trend.kql"; Visual = "timechart"; Description = "Estimated logical payload by month."; X = 0; Y = 17; W = 11; H = 8; Unit = "decbytes" },
@@ -1032,6 +1093,7 @@ function New-DataGrafanaDashboard {
         @{ Name = "DestEndpointKind"; Label = "Destination endpoint kind"; Path = "queries\parameters\05_destination_endpoint_kind.kql" },
         @{ Name = "ClientRegion"; Label = "Client country/region"; Path = "queries\parameters\06_client_region.kql" },
         @{ Name = "DestinationSubscription"; Label = "Destination owning subscription"; Path = "queries\parameters\destination_subscription.kql" },
+        @{ Name = "Customer"; Label = "Customer"; Path = "queries\parameters\customer.kql" },
         @{ Name = "OfferType"; Label = "Destination subscription offer type"; Path = "queries\parameters\offer_type.kql" },
         @{ Name = "SubscriptionScope"; Label = "Destination subscription scope"; Path = "queries\parameters\subscription_scope.kql" }
     )

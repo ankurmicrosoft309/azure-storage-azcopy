@@ -4,7 +4,8 @@ param(
     [string]$AppInsightsResourceGroup = "sharankur_playground",
     [string]$AppInsightsName = "sharankur_insights1",
     [string]$OutputPath = (Join-Path $PSScriptRoot "azcopy-data-metrics.dashboard.json"),
-    [switch]$EnableLiveArgEnrichment = $true
+    [switch]$EnableLiveArgEnrichment = $true,
+    [switch]$EnableAipddEnrichment = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +33,11 @@ $normalizedAppInsightsName = $AppInsightsName.ToLowerInvariant()
 $resourceId = "/subscriptions/$AppInsightsSubscriptionId/resourcegroups/$normalizedResourceGroup/providers/microsoft.insights/components/$normalizedAppInsightsName"
 $appInsightsTable = "cluster('https://adx.monitor.azure.com$resourceId').database('$AppInsightsName').customEvents"
 $xstoreAccountPropertiesTable = "cluster('https://xdataanalytics.westcentralus.kusto.windows.net').database('XDataAnalytics').XStoreAccountPropertiesDaily"
+$aipddSubscriptionSnapshotTable = if ($EnableAipddEnrichment) {
+    "cluster('https://aipddprod.kusto.windows.net').database('AIPDD_Usage').SubscriptionSnapshotV2"
+} else {
+    "datatable(SubscriptionGuid:string, FriendlySubscriptionName:string, AI_OfferType:string, TPID:string, TPName:string, CurrentSubscriptionStatus:string, AI_SubscriptionBusinessStatus:string, AI_UpdatedAt:datetime)[]"
+}
 $argResourcesTable = "cluster('https://argeusarm1pone.eastus.kusto.windows.net').database('AzureResourceGraph').Resources"
 $argSubscriptionsTable = "cluster('https://argeusarm1pone.eastus.kusto.windows.net').database('AzureResourceGraph').InternalSubscriptionResources"
 $enrichmentQuery = Get-Content -Path (Join-Path $PSScriptRoot 'queries/common/enriched_finished_jobs.kql') -Raw
@@ -53,11 +59,15 @@ function Read-Query([string]$RelativePath) {
     $query = $query -replace "(?m)^customEvents", $appInsightsTable
     $query = $query.Replace('__APP_INSIGHTS_CUSTOM_EVENTS__', $appInsightsTable)
     $query = $query.Replace('__XSTORE_ACCOUNT_PROPERTIES__', $xstoreAccountPropertiesTable)
+    $query = $query.Replace('__AIPDD_SUBSCRIPTION_SNAPSHOT__', $aipddSubscriptionSnapshotTable)
     $query = $query.Replace('__ARG_RESOURCES__', $argResourcesTable)
     $query = $query.Replace('__ARG_SUBSCRIPTIONS__', $argSubscriptionsTable)
     $query = $query.Replace(
         '__ENABLE_LIVE_ARG_ENRICHMENT__',
         $(if ($EnableLiveArgEnrichment) { 'true' } else { 'false' }))
+    $query = $query.Replace(
+        '__ENABLE_AIPDD_ENRICHMENT__',
+        $(if ($EnableAipddEnrichment) { 'true' } else { 'false' }))
     if ($query -match '\{\{[A-Z_]+\}\}' -or $query -match '__[A-Z_]+__') {
         throw "Unresolved query template token in '$RelativePath'."
     }
@@ -74,6 +84,7 @@ $knownVariables = @(
     "_destEndpointKind",
     "_clientRegion",
     "_destSubscription",
+    "_customer",
     "_offerType",
     "_subscriptionScope",
     "_account"
@@ -318,8 +329,9 @@ $parameterDefinitions = @(
     @{ VariableName = "_sourceMountType"; DisplayName = "Source mount type"; File = "queries/parameters/04_source_mount_type.kql"; Description = "AzCopy source mount or cloud classification." },
     @{ VariableName = "_destEndpointKind"; DisplayName = "Destination endpoint kind"; File = "queries/parameters/05_destination_endpoint_kind.kql"; Description = "Destination hostname classification; not a complete private-network signal." },
     @{ VariableName = "_clientRegion"; DisplayName = "Client country/region"; File = "queries/parameters/06_client_region.kql"; Description = "Telemetry-sender IP geography, not Storage resource region." },
-    @{ VariableName = "_destSubscription"; DisplayName = "Destination owning subscription"; File = "queries/parameters/destination_subscription.kql"; Description = "Historical owning subscription when available, with current display name from Azure Resource Graph." },
-    @{ VariableName = "_offerType"; DisplayName = "Destination subscription offer type"; File = "queries/parameters/offer_type.kql"; Description = "Current offer type from Azure Resource Graph subscription inventory." },
+    @{ VariableName = "_destSubscription"; DisplayName = "Destination owning subscription"; File = "queries/parameters/destination_subscription.kql"; Description = "Historical owning subscription with AIPDD friendly name, Azure Resource Graph name fallback, or raw subscription ID." },
+    @{ VariableName = "_customer"; DisplayName = "Customer"; File = "queries/parameters/customer.kql"; Description = "AIPDD top-parent customer name; the filter value is the corresponding TPID and remains server-side." },
+    @{ VariableName = "_offerType"; DisplayName = "Destination subscription offer type"; File = "queries/parameters/offer_type.kql"; Description = "AIPDD offer type with Azure Resource Graph fallback." },
     @{ VariableName = "_subscriptionScope"; DisplayName = "Destination subscription scope"; File = "queries/parameters/subscription_scope.kql"; Description = "Internal, External, Unknown, or Not applicable based on current subscription channel metadata." }
 )
 

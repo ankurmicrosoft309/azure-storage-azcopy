@@ -5,6 +5,7 @@ param(
     [string]$Offset = "30d",
     [string]$CentralClusterUri = "https://azcore.centralus.kusto.windows.net",
     [string]$CentralDatabase = "Xstore",
+    [switch]$DisableAipddEnrichment,
     [ValidateRange(1, 10)] [int]$MaxAttempts = 3,
     [string]$QueryDumpDirectory = ""
 )
@@ -24,6 +25,7 @@ $appInsightsTable = "cluster('https://adx.monitor.azure.com$resourceId').databas
 $xstoreAccountPropertiesTable = "cluster('https://xdataanalytics.westcentralus.kusto.windows.net').database('XDataAnalytics').XStoreAccountPropertiesDaily"
 $argResourcesTable = "cluster('https://argeusarm1pone.eastus.kusto.windows.net').database('AzureResourceGraph').Resources"
 $argSubscriptionsTable = "cluster('https://argeusarm1pone.eastus.kusto.windows.net').database('AzureResourceGraph').InternalSubscriptionResources"
+$aipddSubscriptionSnapshotTable = "cluster('https://aipddprod.kusto.windows.net').database('AIPDD_Usage').SubscriptionSnapshotV2"
 $enrichmentQuery = Get-Content -Path (Join-Path $queryRoot "common\enriched_finished_jobs.kql") -Raw
 $enrichmentFilters = Get-Content -Path (Join-Path $queryRoot "common\enrichment_filters.kql") -Raw
 
@@ -31,7 +33,9 @@ function Expand-Tokens(
     [string]$Query,
     [string]$ArgResourcesTable = $argResourcesTable,
     [string]$ArgSubscriptionsTable = $argSubscriptionsTable,
-    [bool]$EnableLiveArgEnrichment = $true
+    [bool]$EnableLiveArgEnrichment = $true,
+    [string]$AipddSubscriptionSnapshotTable = $aipddSubscriptionSnapshotTable,
+    [bool]$EnableAipddEnrichment = (-not $DisableAipddEnrichment)
 ) {
     $expanded = $Query
     $expanded = $expanded.Replace('{{ENRICHED_FINISHED_JOBS}}', $enrichmentQuery.Trim())
@@ -41,9 +45,13 @@ function Expand-Tokens(
     $expanded = $expanded.Replace('__XSTORE_ACCOUNT_PROPERTIES__', $xstoreAccountPropertiesTable)
     $expanded = $expanded.Replace('__ARG_RESOURCES__', $ArgResourcesTable)
     $expanded = $expanded.Replace('__ARG_SUBSCRIPTIONS__', $ArgSubscriptionsTable)
+    $expanded = $expanded.Replace('__AIPDD_SUBSCRIPTION_SNAPSHOT__', $AipddSubscriptionSnapshotTable)
     $expanded = $expanded.Replace(
         '__ENABLE_LIVE_ARG_ENRICHMENT__',
         $(if ($EnableLiveArgEnrichment) { 'true' } else { 'false' }))
+    $expanded = $expanded.Replace(
+        '__ENABLE_AIPDD_ENRICHMENT__',
+        $(if ($EnableAipddEnrichment) { 'true' } else { 'false' }))
     if ($expanded -match '\{\{[A-Z_]+\}\}' -or $expanded -match '__[A-Z_]+__') {
         throw "An unresolved query template token remains."
     }
@@ -62,6 +70,7 @@ function Set-AllParameterValues([string]$Query) {
         '_destSubscription',
         '_offerType',
         '_subscriptionScope',
+        '_customer',
         '_account')) {
         $expanded = $expanded.Replace($variable, "''")
     }
@@ -267,6 +276,7 @@ $standardBranches = foreach ($relativePath in $standardTileFiles) {
 }
 foreach ($relativePath in @(
     "queries/parameters/destination_subscription.kql",
+    "queries/parameters/customer.kql",
     "queries/parameters/offer_type.kql")) {
     $body = Get-BodyAfterMarker -RelativePath $relativePath -Marker '{{ENRICHED_FINISHED_JOBS}}'
     $standardBranches += New-ValidationBranch -Name $relativePath -Body $body
@@ -286,6 +296,7 @@ $selectedValues = [ordered]@{
     '_destSubscription' = "'Unmapped', 'Not applicable'"
     '_offerType' = "'Unknown', 'Not applicable'"
     '_subscriptionScope' = "'Internal', 'External'"
+    '_customer' = "'Unmapped'"
 }
 foreach ($entry in $selectedValues.GetEnumerator()) {
     $selectedValueFilters = $selectedValueFilters.Replace(
@@ -333,6 +344,42 @@ EnrichedFinishedJobs
 "@
 Invoke-KustoValidation -Name "Live ARG enrichment enabled" -Query $liveArgQuery
 
+$liveAipddQuery = @"
+let QueryStart = ago($Offset);
+let QueryEnd = now();
+$(Expand-Tokens $enrichmentQuery $argResourcesTable $argSubscriptionsTable $true $aipddSubscriptionSnapshotTable $true)
+EnrichedFinishedJobs
+| summarize
+    Rows = count(),
+    SubscriptionMappings = countif(AipddSubscriptionInventoryStatus == 'Mapped'),
+    CustomerMappings = countif(CustomerInventoryStatus == 'Mapped')
+"@
+Invoke-KustoValidation -Name "AIPDD enrichment enabled" -Query $liveAipddQuery
+
+$disabledAipddQuery = @"
+let QueryStart = ago($Offset);
+let QueryEnd = now();
+$(Expand-Tokens $enrichmentQuery $argResourcesTable $argSubscriptionsTable $true $aipddSubscriptionSnapshotTable $false)
+EnrichedFinishedJobs
+| summarize
+    Rows = count(),
+    DisabledSubscriptionStates = countif(AipddSubscriptionInventoryStatus == 'AIPDD enrichment disabled'),
+    DisabledCustomerStates = countif(CustomerInventoryStatus == 'AIPDD enrichment disabled')
+"@
+Invoke-KustoValidation -Name "AIPDD enrichment explicitly disabled" -Query $disabledAipddQuery
+
+$enrichmentInvariantQuery = @"
+let QueryStart = ago($Offset);
+let QueryEnd = now();
+$(Expand-Tokens $enrichmentQuery $argResourcesTable $argSubscriptionsTable $true $aipddSubscriptionSnapshotTable $true)
+let RawTotals = RawFinishedJobs | summarize Rows = count(), Bytes = sum(BytesTransferred);
+let EnrichedTotals = EnrichedFinishedJobs | summarize Rows = count(), Bytes = sum(BytesTransferred);
+print
+    RowCountPreserved = assert(toscalar(RawTotals | project Rows) == toscalar(EnrichedTotals | project Rows), 'AIPDD enrichment changed the finished-job row count'),
+    ByteTotalPreserved = assert(toscalar(RawTotals | project Bytes) == toscalar(EnrichedTotals | project Bytes), 'AIPDD enrichment changed the finished-job byte total')
+"@
+Invoke-KustoValidation -Name "Enrichment row and byte invariants" -Query $enrichmentInvariantQuery
+
 $disabledArgQuery = @"
 let QueryStart = ago($Offset);
 let QueryEnd = now();
@@ -360,6 +407,22 @@ EnrichedFinishedJobs
 Invoke-KustoValidation `
     -Name "ARG best-effort fallback" `
     -Query $argFallbackQuery `
+    -AllowQueryStatusFailures
+
+$missingAipddTable = "cluster('https://aipddprod.kusto.windows.net').database('AIPDD_Usage').AzCopyMissingSubscriptionSnapshot"
+$aipddFallbackQuery = @"
+let QueryStart = ago($Offset);
+let QueryEnd = now();
+$(Expand-Tokens $enrichmentQuery $argResourcesTable $argSubscriptionsTable $true $missingAipddTable $true)
+EnrichedFinishedJobs
+| summarize
+    Rows = count(),
+    SubscriptionMappings = countif(AipddSubscriptionInventoryStatus == 'Mapped'),
+    CustomerMappings = countif(CustomerInventoryStatus == 'Mapped')
+"@
+Invoke-KustoValidation `
+    -Name "AIPDD best-effort fallback" `
+    -Query $aipddFallbackQuery `
     -AllowQueryStatusFailures
 
 Write-Host "All AzCopy data dashboard query batches passed."

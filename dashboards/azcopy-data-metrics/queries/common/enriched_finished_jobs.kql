@@ -1,5 +1,6 @@
 set best_effort=true;
 let EnableLiveArgEnrichment = __ENABLE_LIVE_ARG_ENRICHMENT__;
+let EnableAipddEnrichment = __ENABLE_AIPDD_ENRICHMENT__;
 let RawFinishedJobs = materialize(
     __APP_INSIGHTS_CUSTOM_EVENTS__
     | where timestamp between (QueryStart .. QueryEnd)
@@ -229,6 +230,52 @@ let JobsWithAccountInventory = materialize(
         HistoricalSubscriptionId,
         ResourceSubscriptionId)
 );
+let DestinationSubscriptionSet = toscalar(
+    JobsWithAccountInventory
+    | where isnotempty(DestinationSubscriptionId)
+    | summarize make_set(DestinationSubscriptionId, 100000)
+);
+let AipddSubscriptionSnapshot = materialize(
+    union isfuzzy=true
+        (
+            datatable(
+                DestinationSubscriptionId:string,
+                AipddFriendlySubscriptionName:string,
+                AipddOfferType:string,
+                AipddCustomerKey:string,
+                AipddCustomerName:string,
+                AipddCurrentSubscriptionStatus:string,
+                AipddSubscriptionBusinessStatus:string,
+                AipddUpdatedAt:datetime
+            )[]
+        ),
+        (
+            __AIPDD_SUBSCRIPTION_SNAPSHOT__
+            | where EnableAipddEnrichment
+            | where array_length(DestinationSubscriptionSet) > 0
+            | where isnotnull(SubscriptionGuid)
+            | extend DestinationSubscriptionId = tolower(tostring(SubscriptionGuid))
+            | where DestinationSubscriptionId in (DestinationSubscriptionSet)
+            | project
+                DestinationSubscriptionId,
+                AipddFriendlySubscriptionName = tostring(FriendlySubscriptionName),
+                AipddOfferType = tostring(AI_OfferType),
+                AipddCustomerKey = tostring(TPID),
+                AipddCustomerName = tostring(TPName),
+                AipddCurrentSubscriptionStatus = tostring(CurrentSubscriptionStatus),
+                AipddSubscriptionBusinessStatus = tostring(AI_SubscriptionBusinessStatus),
+                AipddUpdatedAt = todatetime(AI_UpdatedAt)
+        )
+    | summarize arg_max(
+        AipddUpdatedAt,
+        AipddFriendlySubscriptionName,
+        AipddOfferType,
+        AipddCustomerKey,
+        AipddCustomerName,
+        AipddCurrentSubscriptionStatus,
+        AipddSubscriptionBusinessStatus)
+      by DestinationSubscriptionId
+);
 let CurrentSubscriptionInventory = materialize(
     CurrentArgInventory
     | where isnotempty(ResourceSubscriptionId)
@@ -241,11 +288,15 @@ let CurrentSubscriptionInventory = materialize(
       by SubscriptionId = ResourceSubscriptionId
     | where SubscriptionDeleted == false
 );
-let EnrichedFinishedJobs = materialize(
+let JobsWithSubscriptionInventory = materialize(
     JobsWithAccountInventory
     | join kind=leftouter CurrentSubscriptionInventory
         on $left.DestinationSubscriptionId == $right.SubscriptionId
     | project-away SubscriptionId
+);
+let EnrichedFinishedJobs = materialize(
+    JobsWithSubscriptionInventory
+    | join kind=leftouter AipddSubscriptionSnapshot on DestinationSubscriptionId
     | extend DestinationUsesStorageAccount = DestType in ('Blob', 'BlobFS', 'File', 'FileNFS')
     | extend
         DestinationSubscriptionKey = case(
@@ -255,13 +306,32 @@ let EnrichedFinishedJobs = materialize(
         DestinationSubscription = case(
             not(DestinationUsesStorageAccount), 'Not applicable',
             isempty(DestinationSubscriptionId), 'Unmapped',
-            isempty(SubscriptionDisplayNameValue), DestinationSubscriptionId,
-            strcat(SubscriptionDisplayNameValue, ' (', DestinationSubscriptionId, ')')),
+            isnotempty(AipddFriendlySubscriptionName),
+                strcat(AipddFriendlySubscriptionName, ' (', DestinationSubscriptionId, ')'),
+            isnotempty(SubscriptionDisplayNameValue),
+                strcat(SubscriptionDisplayNameValue, ' (', DestinationSubscriptionId, ')'),
+            DestinationSubscriptionId),
         OfferType = case(
             not(DestinationUsesStorageAccount), 'Not applicable',
-            not(EnableLiveArgEnrichment), 'Live ARG disabled',
-            isempty(OfferTypeValue), 'Unknown',
-            OfferTypeValue),
+            isnotempty(AipddOfferType), AipddOfferType,
+            isnotempty(OfferTypeValue), OfferTypeValue,
+            not(EnableAipddEnrichment) and not(EnableLiveArgEnrichment),
+                'Subscription enrichment disabled',
+            'Unknown'),
+        CustomerKey = case(
+            not(DestinationUsesStorageAccount), 'Not applicable',
+            not(EnableAipddEnrichment), 'AIPDD enrichment disabled',
+            isempty(AipddCustomerKey), 'Unmapped',
+            AipddCustomerKey),
+        CustomerName = case(
+            not(DestinationUsesStorageAccount), 'Not applicable',
+            not(EnableAipddEnrichment), 'AIPDD enrichment disabled',
+            isnotempty(AipddCustomerName), AipddCustomerName,
+            isnotempty(AipddFriendlySubscriptionName)
+                or isnotempty(AipddOfferType)
+                or isnotempty(AipddCurrentSubscriptionStatus)
+                or isnotempty(AipddSubscriptionBusinessStatus), 'Customer unavailable',
+            'Unmapped customer'),
         SubscriptionChannel = case(
             not(DestinationUsesStorageAccount), 'Not applicable',
             not(EnableLiveArgEnrichment), 'Live ARG disabled',
@@ -322,5 +392,24 @@ let EnrichedFinishedJobs = materialize(
             not(EnableLiveArgEnrichment), 'Live ARG disabled',
             isempty(DestinationSubscriptionId), 'Missing account inventory',
             isnotempty(SubscriptionSnapshot), 'Mapped',
-            'Missing subscription inventory')
+            'Missing subscription inventory'),
+        AipddSubscriptionInventoryStatus = case(
+            not(DestinationUsesStorageAccount), 'Not applicable',
+            not(EnableAipddEnrichment), 'AIPDD enrichment disabled',
+            isempty(DestinationSubscriptionId), 'Missing account inventory',
+            isnotempty(AipddFriendlySubscriptionName)
+                or isnotempty(AipddOfferType)
+                or isnotempty(AipddCurrentSubscriptionStatus)
+                or isnotempty(AipddSubscriptionBusinessStatus), 'Mapped',
+            'Missing AIPDD subscription'),
+        CustomerInventoryStatus = case(
+            not(DestinationUsesStorageAccount), 'Not applicable',
+            not(EnableAipddEnrichment), 'AIPDD enrichment disabled',
+            isempty(DestinationSubscriptionId), 'Missing account inventory',
+            isempty(AipddFriendlySubscriptionName)
+                and isempty(AipddOfferType)
+                and isempty(AipddCurrentSubscriptionStatus)
+                and isempty(AipddSubscriptionBusinessStatus), 'Missing AIPDD subscription',
+            isnotempty(AipddCustomerKey) and isnotempty(AipddCustomerName), 'Mapped',
+            'Subscription mapped, customer unavailable')
 );

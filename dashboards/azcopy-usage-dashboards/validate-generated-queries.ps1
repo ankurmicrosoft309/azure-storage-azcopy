@@ -24,6 +24,7 @@ let _invocationContext = '';
 let _sourceType = '';
 let _destType = '';
 let _subscriptionScope = '';
+let _customer = '';
 "@
 
 function Get-KustoQueryStatusFailures([object]$Response) {
@@ -48,6 +49,10 @@ function Get-KustoQueryStatusFailures([object]$Response) {
         }
     }
     return @($failures)
+}
+
+function Test-IsExpectedEnrichmentStatusFailure([string]$Failure) {
+    return $Failure -match '(?i)^Warning: Cross-cluster query failure .*cluster\(''https://(argeusarm1pone\.eastus|aipddprod|xdataanalytics\.westcentralus)\.kusto\.windows\.net/'
 }
 
 function Test-IsTransientKustoFailure([System.Management.Automation.ErrorRecord]$ErrorRecord) {
@@ -115,10 +120,28 @@ function Invoke-KustoQuery([string]$Name, [string]$Query) {
                 -TimeoutSec 600
             $queryStatusFailures = @(Get-KustoQueryStatusFailures $response)
             if ($queryStatusFailures.Count -gt 0) {
-                throw "Kusto returned query status failures: $($queryStatusFailures -join ' | ')"
+                $hasPrimaryResult = @(
+                    $response.Tables | Where-Object {
+                        $_.TableKind -eq 'PrimaryResult' -or
+                        (@($_.Columns | ForEach-Object { $_.ColumnName }) -notcontains 'StatusCode')
+                    }
+                ).Count -gt 0
+                $unexpectedStatusFailures = @(
+                    $queryStatusFailures | Where-Object {
+                        -not (Test-IsExpectedEnrichmentStatusFailure $_)
+                    }
+                )
+                if (-not $hasPrimaryResult -or $unexpectedStatusFailures.Count -gt 0) {
+                    throw "Kusto returned query status failures: $($queryStatusFailures -join ' | ')"
+                }
             }
             $stopwatch.Stop()
-            Write-Host "PASS $Name ($([Math]::Round($stopwatch.Elapsed.TotalSeconds, 1))s)"
+            $statusSuffix = if ($queryStatusFailures.Count -gt 0) {
+                " with $($queryStatusFailures.Count) expected enrichment warning(s)"
+            } else {
+                ""
+            }
+            Write-Host "PASS $Name$statusSuffix ($([Math]::Round($stopwatch.Elapsed.TotalSeconds, 1))s)"
             return
         }
         catch {

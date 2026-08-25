@@ -16,6 +16,7 @@ FilteredFinishedJobs
     SourceAccount,
     DestinationAccount,
     DestinationSubscription,
+    CustomerName,
     OfferType,
     SubscriptionScope,
     StorageRegion,
@@ -28,5 +29,10 @@ FilteredFinishedJobs
     AccountInventoryStatus,
     ResourceInventoryStatus,
     SubscriptionInventoryStatus,
+    AipddSubscriptionInventoryStatus,
+    CustomerInventoryStatus,
+    AipddCurrentSubscriptionStatus,
+    AipddSubscriptionBusinessStatus,
+    AipddUpdatedAt,
     DataGB = round(BytesTransferred / 1000000000.0, 3),
     ObjectsCompleted
