@@ -1,0 +1,85 @@
+trigger: none
+pr: none
+
+parameters:
+  - name: validateOnly
+    displayName: Validate the EV2 rollout without deploying
+    type: boolean
+    default: true
+  - name: rolloutType
+    displayName: Managed SDP rollout type
+    type: string
+    default: normal
+    values:
+      - normal
+      - emergency
+      - globaloutage
+  - name: overrideManagedValidationDuration
+    displayName: Override the standard Managed SDP duration
+    type: boolean
+    default: false
+  - name: managedValidationOverrideDurationInHours
+    displayName: Managed validation override duration in hours
+    type: number
+    default: 0
+  - name: icmIncidentId
+    displayName: IcM incident ID
+    type: number
+    default: 0
+
+variables:
+  LinuxContainerImage: mcr.microsoft.com/onebranch/azurelinux/build:3.0
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+  pipelines:
+    - pipeline: origin
+      source: Azure.azure-storage-azcopy
+      branch: refs/heads/main
+      trigger: none
+
+name: $(Date:yyyyMMdd).$(Rev:r).AzCopy.Telemetry.Production
+
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      ev2managedsdpsupport: true
+      WindowsHostVersion:
+        Version: 2022
+    ev2ManagedSdpRolloutConfig:
+      rolloutType: ${{ parameters.rolloutType }}
+      overrideManagedValidationDuration: ${{ parameters.overrideManagedValidationDuration }}
+      managedValidationOverrideDurationInHours: ${{ parameters.managedValidationOverrideDurationInHours }}
+      icmIncidentId: ${{ parameters.icmIncidentId }}
+    stages:
+      - stage: Prod_Managed_SDP
+        displayName: 'Production: AzCopy telemetry rollout'
+        variables:
+          ob_release_environment: Production
+        jobs:
+          - job: Rollout
+            displayName: 'Roll out AzCopy telemetry to East US'
+            pool:
+              type: release
+            steps:
+              - download: origin
+                artifact: ev2-telemetry-prod
+              - task: vsrm-ev2.ev2-rollout.ev2-rollout-task.Ev2RARollout@2
+                displayName: 'EV2 Managed SDP rollout'
+                inputs:
+                  TaskAction: RegisterAndRollout
+                  ValidateOnly: ${{ parameters.validateOnly }}
+                  ForceRegistration: true
+                  SkipRegistrationIfExists: true
+                  EndpointProviderType: ApprovalService
+                  ApprovalServiceEnvironment: Production
+                  ServiceRootLocation: LinkedArtifact
+                  ServiceRootPath: '$(Pipeline.Workspace)/origin/ev2-telemetry-prod'
+                  RolloutSpecPath: '$(Pipeline.Workspace)/origin/ev2-telemetry-prod/RolloutSpec.json'
+                  StageMapName: 'Microsoft.Azure.SDP.Standard'
+                  Select: 'regions(eastus)'

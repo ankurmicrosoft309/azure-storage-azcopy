@@ -1,0 +1,53 @@
+{
+  "$schema": "https://ev2schema.azure.net/schemas/2020-04-01/RegionAgnosticRolloutSpecification.json",
+  "contentVersion": "1.0.0.0",
+  "rolloutMetadata": {
+    "serviceModelPath": "ServiceModel.json",
+    "scopeBindingsPath": "ScopeBindings.json",
+    "name": "Microsoft.Azure.Storage.AzCopy.Telemetry.Prod",
+    "rolloutType": "Major",
+    "buildSource": {
+      "parameters": {
+        "versionFile": "numeric.fileversion.info"
+      }
+    },
+    "notification": {
+      "email": {
+        "to": "xdatamovecore@microsoft.com",
+        "options": {
+          "when": [
+            "onError",
+            "onComplete"
+          ]
+        }
+      }
+    }
+  },
+  "onFailure": {
+    "retry": {
+      "conditions": {
+        "errorsContainAny": [
+          "DeploymentTimeout",
+          "InternalServerError",
+          "ServiceUnavailable",
+          "SubscriptionRequestsThrottled",
+          "Timeout",
+          "TransientError"
+        ]
+      },
+      "maxRetryAttempts": 3,
+      "waitDurationBetweenRetry": "PT5M",
+      "fallbackToManualMitigation": true
+    }
+  },
+  "orchestratedSteps": [
+    {
+      "name": "DeployAzCopyTelemetry",
+      "targetType": "ServiceResourceDefinition",
+      "targetName": "AzCopyTelemetryResources",
+      "actions": [
+        "Deploy"
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 jobs:
   - job: Validate_Telemetry_Bicep
-    displayName: 'Validate Telemetry Bicep'
+    displayName: 'Validate Telemetry Bicep and EV2 package'
     pool:
       vmImage: 'ubuntu-latest'
     steps:
@@ -17,6 +17,14 @@ jobs:
             --file infra/telemetry/prod.bicepparam \
             --outfile "$(Build.ArtifactStagingDirectory)/telemetry-bicep/prod.parameters.json"
         displayName: 'Compile telemetry infrastructure'
+      - pwsh: |
+          ./deployment/ev2/telemetry/Test-TelemetryEv2PackageDeterminism.ps1 `
+            -OutputPath "$(Build.ArtifactStagingDirectory)/ev2-telemetry-prod" `
+            -BuildVersion "1.0.$(Build.BuildId).0"
+        displayName: 'Generate and validate deterministic telemetry EV2 package'
+      - publish: '$(Build.ArtifactStagingDirectory)/ev2-telemetry-prod'
+        artifact: ev2-telemetry-prod
+        displayName: 'Publish production telemetry EV2 package'
 
   - job: Build
     timeoutInMinutes: 360

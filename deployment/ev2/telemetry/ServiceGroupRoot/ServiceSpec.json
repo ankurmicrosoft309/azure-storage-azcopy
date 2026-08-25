@@ -1,0 +1,9 @@
+{
+  "providerType": "ServiceTree",
+  "identifier": "c88bf702-9a3e-4962-a15d-dbc3c3a8f42f",
+  "description": "AzCopy production telemetry resources",
+  "ownerGroupContactEmail": "xdatamovecore@microsoft.com",
+  "policyCheckEnabled": true,
+  "contentVersion": "1.0.0.0",
+  "orchestrationType": "regional"
+}
