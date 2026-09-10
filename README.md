@@ -43,6 +43,31 @@ account values. Full URLs, SAS tokens, credentials, paths, and object names are
 not included in these properties. Account names are linkable identifiers, so
 this telemetry should not be treated as anonymous.
 
+New events from this branch use `SchemaVersion=1`, reset from 3 without removing
+existing dimensions or measurements. `SourceEndpointKind` and `DestEndpointKind`
+independently classify Azure hostnames as `private-endpoint` when they contain
+`.privatelink.`, otherwise `public`; non-Azure or unparseable endpoints produce
+empty values. This performs no DNS lookup and does not prove the network route:
+a public hostname can resolve through private DNS. Copy, sync, resume, and
+benchmark job events share this classification logic.
+
+Updated consumers accept version 1 and retain their previously supported versions.
+Historical missing source-endpoint fields are not assumed public. Version 1 alone
+does not distinguish older payload shapes; consumers must validate required fields.
+Deploy updated queries before consuming the reset schema. ADX/Grafana dashboard
+import-format versions are unrelated and unchanged.
+
+`AzureVMDetected` uses the local SMBIOS chassis asset tag on Windows and Linux.
+`true` means the documented Azure public-cloud marker matched; `false` means
+not detected, not proof that the host is outside Azure. Unreadable firmware,
+unsupported platforms, and environments without the marker return `false`.
+This method does not identify Azure sovereign clouds or Azure Local. No firmware
+contents, asset tags, or serial numbers are sent; only the boolean is recorded.
+Telemetry detection makes no IMDS request and has no network fallback. This does
+not change IMDS usage required by managed-identity authentication. The marker is
+for telemetry classification, not identity attestation or authorization. See
+[Microsoft's platform detection guidance](https://learn.microsoft.com/en-us/azure/virtual-machines/identify-azure-vm-from-guest).
+
 Disable telemetry with `--disable-telemetry` or by setting
 `AZCOPY_DISABLE_TELEMETRY=true`. Override the destination by setting
 `AZCOPY_TELEMETRY_CONNECTION_STRING` to another connection string before starting
@@ -50,9 +75,13 @@ AzCopy. An unset or blank override uses the embedded test destination. The agent
 caches its configuration for the process lifetime. This test default is temporary
 and must be replaced with the approved production destination before release.
 
-Telemetry send failures drop the affected event without retrying or disabling
-later events. A failed start-event send therefore does not suppress the finish
-event. Telemetry initialization panics disable telemetry for that process;
+Telemetry transport failures, ingestion rejections (including partial acceptance),
+and throttling disable the entire telemetry pipeline for the rest of the process.
+Queued and future events are suppressed, active requests are cancelled, and
+source-shape collection stops. Already transmitted events cannot be recalled.
+There is no retry or automatic recovery within that process; transfers continue
+independently. Local serialization errors and send panics drop the affected event.
+Telemetry initialization panics disable telemetry for that process;
 dimension-collection panics drop that attempt's telemetry, and finalization
 panics drop its finish event. Telemetry-generated failure diagnostics omit
 response bodies, transport error details, and panic values.
