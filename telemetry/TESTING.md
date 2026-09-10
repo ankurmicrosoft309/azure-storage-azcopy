@@ -48,6 +48,16 @@ These are offline unit checks. They do not launch the credential-dependent cloud
 
 Unit-level integration tests use the real reporter/dispatcher with local `httptest` endpoints for rejection, partial acceptance, 429/503 throttling, and concurrent-request cancellation. DNS, TLS, and offline failures are injected through the HTTP transport; a blocked client exercises deadline expiry. Tests verify a queued finish never reaches the endpoint after a failed start, later events remain disabled even if the endpoint would recover, existing collectors stop, and healthy ingestion still reports failed transfers. Reporter tests verify typed classification through both backends and preserve safe diagnostics. No Application Insights resource, credentials, or ingestion polling is required for these policy tests.
 
+## Local CLI End-To-End Scenarios
+
+Run `./testSuite/telemetry-cli-e2e.ps1` for actual AzCopy subprocess tests against
+loopback Storage and telemetry receivers. This covers command policy, copy/sync
+metric reconciliation and dry-runs, opt-out/configuration, concurrent installation
+identity, graceful cancellation and plan-based resume, benchmark download and
+upload/cleanup suppression, payload/privacy checks, and ingestion-failure/latency non-interference.
+It requires no Azure resources. See [scenario coverage](SCENARIO_COVERAGE.md) for
+the document-to-test matrix, explicit real-service limitations, and deferred work.
+
 ## Manual Real-Endpoint Fault Tests
 
 See [manual live testing](LIVE_TESTING.md) for real Application Insights quota and

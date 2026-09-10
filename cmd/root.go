@@ -326,7 +326,7 @@ func commandUsesJobAttemptTelemetry(command string) bool {
 
 func commandExcludedFromTelemetry(command string) bool {
 	_, ok := commandsExcludedFromTelemetry[command]
-	return ok
+	return ok || strings.HasPrefix(command, "completion.")
 }
 
 func telemetryOptions(cmd *cobra.Command) telemetry.OptionAttributes {
