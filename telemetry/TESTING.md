@@ -43,6 +43,10 @@ The manifest derives JobID, command, and endpoint types from the harness, and av
 
 InvocationID and InstallationID are validated from observed events, not independently predicted by the harness. Text-only output without a JSON final summary cannot provide exact terminal counter expectations. Missing pairs are polled within a bounded query context; duplicates and inconsistent data in a returned snapshot fail immediately. Duplicates arriving after successful verification are outside that observation window. This verifies delivery in the E2E environment, not a production delivery guarantee.
 
+The five-minute observation window is separate from each query's 30-second request timeout. An in-flight query may finish after the observation window closes, adding at most one request budget to teardown. Its response is still validated, and query errors or caller cancellation still fail verification; expiry of the observation window alone must not cancel an otherwise healthy query.
+
+On macOS, the E2E harness admits one AzCLI-authenticated child startup at a time to reduce credential subprocess contention. The slot is released at the first valid JobID, at process exit, or after a one-minute lease; acquisition also has a one-minute timeout. Transfers remain parallel. Other authentication modes, platforms, and debugger launches are unchanged. This does not retry failed commands or extend production authentication deadlines.
+
 ## Aggregate Replay
 
 ```powershell
