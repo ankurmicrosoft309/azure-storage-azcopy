@@ -17,10 +17,12 @@ var _ AzCopyStdout = &AzCopyParsedJobsListStdout{}
 var _ AzCopyStdout = &AzCopyParsedJobsShowStdout{}
 
 type azCopyJobIDCapture struct {
-	target  AzCopyStdout
-	mu      sync.Mutex
-	pending string
-	jobID   string
+	target       AzCopyStdout
+	mu           sync.Mutex
+	pending      string
+	jobID        string
+	finalSummary *common.ListJobSummaryResponse
+	onJobID      func()
 }
 
 func newAzCopyJobIDCapture(target AzCopyStdout) *azCopyJobIDCapture {
@@ -47,10 +49,6 @@ func (c *azCopyJobIDCapture) capture(chunk string, flush bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.jobID != "" {
-		return
-	}
-
 	c.pending += chunk
 	for {
 		lineEnd := strings.IndexByte(c.pending, '\n')
@@ -60,9 +58,7 @@ func (c *azCopyJobIDCapture) capture(chunk string, flush bool) {
 
 		line := strings.TrimSuffix(c.pending[:lineEnd], "\r")
 		c.pending = c.pending[lineEnd+1:]
-		if c.captureLine(line) {
-			return
-		}
+		c.captureLine(line)
 	}
 
 	if flush && c.pending != "" {
@@ -72,8 +68,26 @@ func (c *azCopyJobIDCapture) capture(chunk string, flush bool) {
 	}
 }
 
+func (c *azCopyJobIDCapture) FinalSummary() *common.ListJobSummaryResponse {
+	c.capture("", true)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.finalSummary == nil {
+		return nil
+	}
+	summary := *c.finalSummary
+	return &summary
+}
+
 func (c *azCopyJobIDCapture) captureLine(line string) bool {
 	var output cmd.JsonOutputTemplate
+	if json.Unmarshal([]byte(line), &output) == nil && output.MessageType == cmd.EOutputMessageType.EndOfJob().String() {
+		var summary common.ListJobSummaryResponse
+		if json.Unmarshal([]byte(output.MessageContent), &summary) == nil && !summary.JobID.IsEmpty() {
+			c.finalSummary = &summary
+			return c.setJobID(summary.JobID.String())
+		}
+	}
 	if json.Unmarshal([]byte(line), &output) == nil &&
 		output.MessageType == cmd.EOutputMessageType.Init().String() {
 		var initMessage cmd.InitMsgJsonTemplate
@@ -101,6 +115,9 @@ func (c *azCopyJobIDCapture) setJobID(candidate string) bool {
 	}
 
 	c.jobID = jobID.String()
+	if c.onJobID != nil {
+		c.onJobID()
+	}
 	return true
 }
 

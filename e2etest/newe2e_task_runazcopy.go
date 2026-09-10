@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
@@ -333,6 +335,7 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 	a.HelperMarker().Helper()
 	var flagMap map[string]string
 	var envMap map[string]string
+	var targetArgs []string
 
 	// we have no need to update our context manager, Fetch should do it for us.
 	envCtx := FetchAzCopyEnvironmentContext(a)
@@ -364,7 +367,9 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 		}
 
 		for _, v := range commandSpec.Targets {
-			out = append(out, commandSpec.applyTargetAuth(a, v))
+			target := commandSpec.applyTargetAuth(a, v)
+			targetArgs = append(targetArgs, target)
+			out = append(out, target)
 		}
 
 		if commandSpec.Flags == nil {
@@ -504,6 +509,10 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 	}
 
 	stderr := &bytes.Buffer{}
+	processRunID := ""
+	if AppInsightsTelemetryValidationEnabled() {
+		env, processRunID = telemetryProcessEnvironment(env, snapshotAppInsightsValidation().runID)
+	}
 	jobIDCapture := newAzCopyJobIDCapture(out)
 	command := exec.Cmd{
 		Path: GlobalConfig.AzCopyExecutableConfig.ExecutablePath,
@@ -515,6 +524,17 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 	}
 	in, err := command.StdinPipe()
 	a.NoError("get stdin pipe", err)
+
+	var releaseStartup func()
+	if needsAzCLIStartupGate(runtime.GOOS, envMap["AZCOPY_AUTO_LOGIN_TYPE"], isLaunchedByDebugger) {
+		releaseStartup, err = acquireAzCLIStartup(a.Context(), azCLIStartupSlot, time.Minute)
+		a.NoError("acquire AzCLI startup slot", err, true)
+		if err != nil {
+			return out, &AzCopyJobPlan{}
+		}
+		defer releaseStartup()
+		jobIDCapture.onJobID = releaseStartup
+	}
 
 	err = command.Start()
 	a.Assert("run command", IsNil{}, err)
@@ -528,6 +548,9 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 	}
 
 	err = command.Wait()
+	if releaseStartup != nil {
+		releaseStartup()
+	}
 
 	a.Assert("wait for finalize", common.Iff[Assertion](commandSpec.ShouldFail, Not{IsNil{}}, IsNil{}), err)
 	a.Assert("expected exit code",
@@ -548,11 +571,26 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 		flagMap,
 		commandSpec.ShouldFail,
 		jobIDCapture.JobID())
+	noTelemetryExpected := telemetryExpectsNoEvents(commandSpec.Verb, flagMap, env)
+	if noTelemetryExpected {
+		validationDecision = appInsightsJobValidationDecision{}
+	}
 	if AppInsightsTelemetryValidationEnabled() && validationDecision.missingJobID {
 		a.NoError("capture AzCopy job ID for Application Insights validation",
 			fmt.Errorf("AzCopy %s output did not contain a valid job ID", commandSpec.Verb))
 	}
 	RegisterExpectedAppInsightsJob(validationDecision.jobID)
+	if AppInsightsTelemetryValidationEnabled() {
+		if noTelemetryExpected {
+			registerNoTelemetryExpectation(processRunID)
+		} else if validationDecision.jobID != "" {
+			sourceType, destType, endpointErr := telemetryEndpointTypes(targetArgs, flagMap)
+			a.NoError("derive telemetry endpoint types from CLI inputs", endpointErr)
+			registerTelemetryExpectation(processRunID, validationDecision.jobID, commandSpec.Verb, jobIDCapture.FinalSummary(), sourceType, destType)
+			logTelemetryDeliveryEvidence(a, processRunID, validationDecision.jobID,
+				filepath.Join(*commandSpec.Environment.LogLocation, validationDecision.jobID+".log"), stderr.String())
+		}
+	}
 
 	return out, &AzCopyJobPlan{}
 }
@@ -568,7 +606,7 @@ func azCopyVerbProducesJobFinishedTelemetry(verb AzCopyVerb) bool {
 
 func azCopyCommandProducesJobFinishedTelemetry(verb AzCopyVerb, flags map[string]string) bool {
 	return azCopyVerbProducesJobFinishedTelemetry(verb) &&
-		!strings.EqualFold(flags["dry-run"], "true")
+		!telemetryExpectsNoEvents(verb, flags, nil)
 }
 
 type appInsightsJobValidationDecision struct {
