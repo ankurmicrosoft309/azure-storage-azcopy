@@ -51,7 +51,7 @@ type ResourceAttributes struct {
 	HostMemoryTotalGB  int    // total physical memory
 	HostNICSpeedMbps   int    // best-effort; -1 when unavailable
 	HostNICSpeedBucket string // unknown | <1gbps | 1-<10gbps | 10-<40gbps | >=40gbps
-	AzureVMDetected    bool   // true when Azure Instance Metadata Service responds
+	AzureVMDetected    bool   // true for a local Azure public-cloud chassis-tag match; false means not detected
 	InstallationID     string // anonymous, stable per-install identifier (no PII)
 	InvocationContext  string // "interactive" | "ci" | "sdk" | "unknown"
 }
