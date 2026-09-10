@@ -89,7 +89,12 @@ On macOS, the E2E harness admits one AzCLI-authenticated child startup at a time
 ./dashboards/AzCopyQueries/test-deployment.ps1
 ```
 
-The replay script requires an existing Azure CLI login and Kusto query access. It inlines the checked-in producer into a read-only query, replaces all three external sources with synthetic tables, and checks 18 assertions: duplicate/repeated refresh idempotence, cumulative resumes across day/month boundaries, late events, inclusive lookback boundaries, outside-lookback exclusions, schema-3 account fields present/absent/empty/restored, and ownership/customer fallbacks. `-QueryOnly` emits the generated query without authenticating or executing it. No saved function, live source, or persisted aggregate table is read or modified.
+The replay script requires an existing Azure CLI login and Kusto query access. It inlines the checked-in producer into a read-only query, replaces all three external sources with synthetic tables, and checks 19 assertions: schema-1 acceptance, duplicate/repeated refresh idempotence, cumulative resumes across day/month boundaries, late events, inclusive lookback boundaries, outside-lookback exclusions, schema-3 account fields present/absent/empty/restored, and ownership/customer fallbacks. `-QueryOnly` emits the generated query without authenticating or executing it. No saved function, live source, or persisted aggregate table is read or modified.
+
+Run `./dashboards/test-telemetry-schema.ps1` offline to check version-1 compatibility
+in source/generated queries, source-endpoint filter wiring, and replay generation.
+Newly emitted events use schema 1; the E2E manifest requires that exact value.
+Historical version-2/3 dashboard support is retained where previously supported.
 
 ExecutionTime is excluded from idempotence comparisons. Resumes attribute cumulative usage to the latest attempt's day, not incremental bytes to each attempt day. A late resume can move a job out of an earlier reporting window. History older than the 30-day attempt lookback cannot restore its original command or attempt count.
 
