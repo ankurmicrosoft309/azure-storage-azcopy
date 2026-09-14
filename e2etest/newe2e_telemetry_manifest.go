@@ -19,12 +19,18 @@ import (
 
 type telemetryExpectation struct {
 	NoEvents           bool
+	CommandOnly        bool
+	InstallationGroup  string
+	ForbiddenValues    []string
+	AbsentMeasurements []string
 	ProcessRunID       string
 	JobID              string
 	Command            string
 	Properties         map[string]string
 	Measurements       map[string]float64
 	FinishedProperties map[string]string
+	TerminalStages     []string
+	IncompleteProgress bool
 }
 
 type observedTelemetryEvent struct {
@@ -91,6 +97,7 @@ func checkTelemetryManifest(expected []telemetryExpectation, events []observedTe
 	}
 	var missing []string
 	invocationProcesses := make(map[string]string)
+	installations := make(map[string]string)
 	for _, attempt := range expected {
 		if attempt.NoEvents {
 			if len(byProcess[attempt.ProcessRunID]) != 0 {
@@ -101,8 +108,16 @@ func checkTelemetryManifest(expected []telemetryExpectation, events []observedTe
 		invocation := ""
 		installation := ""
 		counts := make(map[string]int)
+		names := []string{"azcopy.job.started", "azcopy.job.finished"}
+		if attempt.CommandOnly {
+			names = []string{"azcopy.command.invoked"}
+		}
 		for _, event := range byProcess[attempt.ProcessRunID] {
-			if event.Name != "azcopy.job.started" && event.Name != "azcopy.job.finished" {
+			allowed := false
+			for _, name := range names {
+				allowed = allowed || event.Name == name
+			}
+			if !allowed {
 				return nil, fmt.Errorf("unexpected event type for process %s", attempt.ProcessRunID)
 			}
 			counts[event.Name]++
@@ -110,7 +125,7 @@ func checkTelemetryManifest(expected []telemetryExpectation, events []observedTe
 				return nil, fmt.Errorf("duplicate %s for process %s", event.Name, attempt.ProcessRunID)
 			}
 			properties := event.Properties
-			if properties["JobID"] != attempt.JobID || properties["Command"] != attempt.Command {
+			if (!attempt.CommandOnly && properties["JobID"] != attempt.JobID) || properties["Command"] != attempt.Command {
 				return nil, fmt.Errorf("job or command mismatch for process %s", attempt.ProcessRunID)
 			}
 			if properties["InvocationID"] == "" || properties["InstallationID"] == "" {
@@ -123,6 +138,24 @@ func checkTelemetryManifest(expected []telemetryExpectation, events []observedTe
 				return nil, fmt.Errorf("different installation IDs for process %s", attempt.ProcessRunID)
 			}
 			invocation, installation = properties["InvocationID"], properties["InstallationID"]
+			if attempt.InstallationGroup != "" {
+				if previous, exists := installations[attempt.InstallationGroup]; exists && previous != installation {
+					return nil, fmt.Errorf("installation ID changed within group %s", attempt.InstallationGroup)
+				}
+				installations[attempt.InstallationGroup] = installation
+			}
+			for _, private := range attempt.ForbiddenValues {
+				for _, value := range properties {
+					if private != "" && strings.Contains(value, private) {
+						return nil, fmt.Errorf("private value emitted for process %s", attempt.ProcessRunID)
+					}
+				}
+			}
+			for _, name := range attempt.AbsentMeasurements {
+				if _, exists := event.Measurements[name]; exists {
+					return nil, fmt.Errorf("unexpected measurement %s for process %s", name, attempt.ProcessRunID)
+				}
+			}
 			if process, exists := invocationProcesses[invocation]; exists && process != attempt.ProcessRunID {
 				return nil, fmt.Errorf("invocation ID reused across processes %s and %s", process, attempt.ProcessRunID)
 			}
@@ -136,6 +169,21 @@ func checkTelemetryManifest(expected []telemetryExpectation, events []observedTe
 				return nil, fmt.Errorf("invalid lifecycle counter for process %s", attempt.ProcessRunID)
 			}
 			if event.Name == "azcopy.job.finished" {
+				if len(attempt.TerminalStages) > 0 {
+					allowedStage := false
+					for _, stage := range attempt.TerminalStages {
+						allowedStage = allowedStage || properties["TerminalStage"] == stage
+					}
+					if !allowedStage {
+						return nil, fmt.Errorf("unexpected terminal stage for process %s", attempt.ProcessRunID)
+					}
+				}
+				if attempt.IncompleteProgress {
+					percent, exists := event.Measurements["azcopy.percent_complete"]
+					if !exists || math.IsNaN(percent) || math.IsInf(percent, 0) || percent < 0 || percent >= 100 {
+						return nil, fmt.Errorf("expected incomplete progress for process %s", attempt.ProcessRunID)
+					}
+				}
 				for key, want := range attempt.FinishedProperties {
 					if properties[key] != want {
 						return nil, fmt.Errorf("terminal property %s mismatch for process %s", key, attempt.ProcessRunID)
@@ -152,7 +200,7 @@ func checkTelemetryManifest(expected []telemetryExpectation, events []observedTe
 				}
 			}
 		}
-		for _, name := range []string{"azcopy.job.started", "azcopy.job.finished"} {
+		for _, name := range names {
 			if counts[name] == 0 {
 				missing = append(missing, attempt.ProcessRunID+"/"+name)
 			}
@@ -172,16 +220,37 @@ func telemetryEndpointTypes(targets []string, flags map[string]string) (string, 
 	return fromTo.From().String(), fromTo.To().String(), nil
 }
 
-func registerTelemetryExpectation(processRunID, jobID string, verb AzCopyVerb, summary *common.ListJobSummaryResponse, sourceType, destType string) {
+func validateTelemetryTerminalSummary(expected *telemetryExpectation, summary *common.ListJobSummaryResponse) error {
+	if expected == nil || expected.NoEvents || expected.CommandOnly || expected.FinishedProperties["JobStatus"] == "" {
+		return nil
+	}
+	if summary == nil || summary.JobID.IsEmpty() {
+		return errors.New("expected terminal scenario did not produce a final summary with a job ID")
+	}
+	if summary.JobStatus.String() != expected.FinishedProperties["JobStatus"] {
+		return fmt.Errorf("expected terminal status %s, got %s", expected.FinishedProperties["JobStatus"], summary.JobStatus)
+	}
+	if expected.IncompleteProgress {
+		percent := float64(summary.PercentComplete)
+		if math.IsNaN(percent) || math.IsInf(percent, 0) || percent < 0 || percent >= 100 {
+			return errors.New("expected terminal scenario did not have incomplete progress")
+		}
+	}
+	return nil
+}
+
+func registerTelemetryExpectation(processRunID, jobID string, verb AzCopyVerb, summary *common.ListJobSummaryResponse, sourceType, destType string, extra ...*telemetryExpectation) {
 	if jobID == "" || processRunID == "" {
 		return
 	}
 	expected := telemetryExpectation{
 		ProcessRunID: processRunID, JobID: jobID, Command: strings.ReplaceAll(string(verb), " ", "."),
-		Properties: map[string]string{"SchemaVersion": "1"},
+		InstallationGroup: jobID,
+		Properties:        map[string]string{"SchemaVersion": "1"},
 	}
 	if verb == AzCopyVerbJobsResume {
 		expected.Properties["SummaryCounterScope"] = "job-cumulative"
+		expected.AbsentMeasurements = []string{"azcopy.job_throughput_mbps", "azcopy.transfer_phase_throughput_mbps"}
 	}
 	if sourceType != "" && destType != "" {
 		expected.Properties["SourceType"] = sourceType
@@ -190,14 +259,74 @@ func registerTelemetryExpectation(processRunID, jobID string, verb AzCopyVerb, s
 	if summary != nil && !summary.JobID.IsEmpty() {
 		expected.FinishedProperties = map[string]string{"JobStatus": summary.JobStatus.String()}
 		expected.Measurements = map[string]float64{
-			"azcopy.bytes_transferred":   float64(summary.TotalBytesTransferred),
-			"azcopy.bytes_over_wire":     float64(summary.BytesOverWire),
-			"azcopy.transfers_total":     float64(summary.TotalTransfers),
-			"azcopy.transfers_completed": float64(summary.TransfersCompleted),
-			"azcopy.transfers_failed":    float64(summary.TransfersFailed),
-			"azcopy.transfers_skipped":   float64(summary.TransfersSkipped),
+			"azcopy.bytes_transferred":                   float64(summary.TotalBytesTransferred),
+			"azcopy.bytes_over_wire":                     float64(summary.BytesOverWire),
+			"azcopy.transfers_total":                     float64(summary.TotalTransfers),
+			"azcopy.transfers_completed":                 float64(summary.TransfersCompleted),
+			"azcopy.transfers_failed":                    float64(summary.TransfersFailed),
+			"azcopy.transfers_skipped":                   float64(summary.TransfersSkipped),
+			"azcopy.bytes_enumerated":                    float64(summary.TotalBytesEnumerated),
+			"azcopy.bytes_expected":                      float64(summary.TotalBytesExpected),
+			"azcopy.regular_files_scheduled":             float64(summary.FileTransfers),
+			"azcopy.folder_properties_scheduled":         float64(summary.FolderPropertyTransfers),
+			"azcopy.objects_scheduled":                   float64(max(int64(summary.TotalTransfers)-int64(summary.FolderPropertyTransfers), 0)),
+			"azcopy.objects_completed":                   float64(max(int64(summary.TransfersCompleted)-int64(summary.FoldersCompleted), 0)),
+			"azcopy.objects_failed":                      float64(max(int64(summary.TransfersFailed)-int64(summary.FoldersFailed), 0)),
+			"azcopy.objects_skipped":                     float64(max(int64(summary.TransfersSkipped)-int64(summary.FoldersSkipped), 0)),
+			"azcopy.symlinks_scheduled":                  float64(summary.SymlinkTransfers),
+			"azcopy.hardlinks_converted_scheduled":       float64(summary.HardlinksConvertedCount),
+			"azcopy.folder_properties_completed":         float64(summary.FoldersCompleted),
+			"azcopy.folder_properties_failed":            float64(summary.FoldersFailed),
+			"azcopy.folder_properties_skipped":           float64(summary.FoldersSkipped),
+			"azcopy.storage_http_attempt_count":          float64(summary.StorageHTTPAttemptCount),
+			"azcopy.network_error_attempt_count":         float64(summary.NetworkErrorAttemptCount),
+			"azcopy.server_busy_503_count":               float64(summary.ServerBusy503Count),
+			"azcopy.server_busy_throughput_count":        float64(summary.ServerBusyThroughputCount),
+			"azcopy.server_busy_iops_count":              float64(summary.ServerBusyIOPSCount),
+			"azcopy.server_busy_other_count":             float64(summary.ServerBusyOtherCount),
+			"azcopy.avg_iops":                            float64(summary.AverageIOPS),
+			"azcopy.average_storage_http_attempt_e2e_ms": float64(summary.AverageE2EMilliseconds),
+			"azcopy.percent_complete":                    float64(summary.PercentComplete),
 		}
 	}
+	if len(extra) > 0 && extra[0] != nil {
+		addition := extra[0]
+		expected.TerminalStages = addition.TerminalStages
+		expected.IncompleteProgress = addition.IncompleteProgress
+		if addition.InstallationGroup != "" {
+			expected.InstallationGroup = addition.InstallationGroup
+		}
+		expected.ForbiddenValues = addition.ForbiddenValues
+		expected.AbsentMeasurements = append(expected.AbsentMeasurements, addition.AbsentMeasurements...)
+		for key, value := range addition.Properties {
+			expected.Properties[key] = value
+		}
+		if expected.FinishedProperties == nil {
+			expected.FinishedProperties = map[string]string{}
+		}
+		for key, value := range addition.FinishedProperties {
+			expected.FinishedProperties[key] = value
+		}
+		if expected.Measurements == nil {
+			expected.Measurements = map[string]float64{}
+		}
+		for key, value := range addition.Measurements {
+			expected.Measurements[key] = value
+		}
+	}
+	globalAppInsightsValidation.mu.Lock()
+	defer globalAppInsightsValidation.mu.Unlock()
+	globalAppInsightsValidation.expectedAttempts = append(globalAppInsightsValidation.expectedAttempts, expected)
+}
+
+func registerCommandTelemetryExpectation(processRunID string, verb AzCopyVerb, extra *telemetryExpectation) {
+	expected := *extra
+	expected.ProcessRunID = processRunID
+	expected.Command = strings.ReplaceAll(string(verb), " ", ".")
+	if expected.Properties == nil {
+		expected.Properties = map[string]string{}
+	}
+	expected.Properties["SchemaVersion"] = "1"
 	globalAppInsightsValidation.mu.Lock()
 	defer globalAppInsightsValidation.mu.Unlock()
 	globalAppInsightsValidation.expectedAttempts = append(globalAppInsightsValidation.expectedAttempts, expected)

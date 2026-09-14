@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,6 +91,123 @@ func TestTelemetryManifest(t *testing.T) {
 		_, err := checkTelemetryManifest(expected, []observedTelemetryEvent{wrong})
 		assert.ErrorContains(t, err, "measurement")
 	})
+}
+
+func TestTelemetryManifestFunctionalCases(t *testing.T) {
+	command := manifestEvent("command", "invocation", "azcopy.command.invoked")
+	command.Properties["Command"] = "jobs.list"
+	command.Properties["JobID"] = ""
+	expected := []telemetryExpectation{{ProcessRunID: "command", Command: "jobs.list", CommandOnly: true}}
+	missing, err := checkTelemetryManifest(expected, []observedTelemetryEvent{command})
+	require.NoError(t, err)
+	require.Empty(t, missing)
+	_, err = checkTelemetryManifest(expected, []observedTelemetryEvent{command, command})
+	require.ErrorContains(t, err, "duplicate")
+	expected[0].NoEvents = true
+	_, err = checkTelemetryManifest(expected, []observedTelemetryEvent{command})
+	require.ErrorContains(t, err, "unexpected telemetry")
+	expected[0].NoEvents = false
+	expected[0].ForbiddenValues = []string{"private-canary"}
+	command.Properties["Unexpected"] = "private-canary"
+	_, err = checkTelemetryManifest(expected, []observedTelemetryEvent{command})
+	require.ErrorContains(t, err, "private value")
+	delete(command.Properties, "Unexpected")
+	expected[0].ForbiddenValues = []string{`C:\private\download.bin`}
+	command.Properties["Unexpected"] = `C:\private\download.bin`
+	_, err = checkTelemetryManifest(expected, []observedTelemetryEvent{command})
+	require.ErrorContains(t, err, "private value")
+	delete(command.Properties, "Unexpected")
+	expected[0].AbsentMeasurements = []string{"azcopy.job_throughput_mbps"}
+	command.Measurements["azcopy.job_throughput_mbps"] = 1
+	_, err = checkTelemetryManifest(expected, []observedTelemetryEvent{command})
+	require.ErrorContains(t, err, "unexpected measurement")
+	delete(command.Measurements, "azcopy.job_throughput_mbps")
+	expected[0].InstallationGroup = "shared"
+	expected = append(expected, telemetryExpectation{ProcessRunID: "other", JobID: "job", Command: "copy", InstallationGroup: "shared"})
+	other := manifestEvent("other", "different-invocation", "azcopy.job.started")
+	other.Properties["InstallationID"] = "different-installation"
+	_, err = checkTelemetryManifest(expected, []observedTelemetryEvent{command, other})
+	require.ErrorContains(t, err, "installation ID changed")
+}
+
+func TestTelemetryBenchmarkPrimaryCapture(t *testing.T) {
+	capture := newAzCopyJobIDCapture(&AzCopyRawStdout{})
+	capture.firstJobOnly = true
+	primary, cleanup := common.NewJobID(), common.NewJobID()
+	for _, job := range []common.JobID{primary, cleanup} {
+		content, err := json.Marshal(common.ListJobSummaryResponse{JobID: job, JobStatus: common.EJobStatus.Completed()})
+		require.NoError(t, err)
+		line, err := json.Marshal(cmd.JsonOutputTemplate{MessageType: "EndOfJob", MessageContent: string(content)})
+		require.NoError(t, err)
+		for _, value := range append(line, '\n') {
+			_, err = capture.Write([]byte{value})
+			require.NoError(t, err)
+		}
+	}
+	require.Equal(t, primary.String(), capture.JobID())
+	require.Equal(t, primary, capture.FinalSummary().JobID)
+	summaries := capture.Summaries()
+	require.Len(t, summaries, 2)
+	require.Equal(t, cleanup, summaries[1].JobID)
+}
+
+func TestTelemetryManifestAuthCloud(t *testing.T) {
+	for _, test := range []struct {
+		name, fromTo, sourceAuth, destinationAuth, sourceCloud, destinationCloud string
+	}{
+		{"SAS download", "BlobLocal", "SAS", "NotApplicable", "public", ""},
+		{"OAuth upload", "LocalBlobFS", "NotApplicable", "OAuth", "", "public"},
+		{"OAuth service copy", "FileBlob", "OAuth", "OAuth", "public", "public"},
+		{"mixed service auth", "BlobBlob", "SAS", "OAuth", "public", "public"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			properties := map[string]string{
+				"FromTo":              test.fromTo,
+				"SourceAuthMechanism": test.sourceAuth, "DestAuthMechanism": test.destinationAuth,
+				"SourceCloudType": test.sourceCloud, "DestCloudType": test.destinationCloud,
+			}
+			expected := []telemetryExpectation{{ProcessRunID: "process", JobID: "job", Command: "copy", Properties: properties}}
+			makeEvents := func() []observedTelemetryEvent {
+				events := []observedTelemetryEvent{
+					manifestEvent("process", "invocation", "azcopy.job.started"),
+					manifestEvent("process", "invocation", "azcopy.job.finished"),
+				}
+				for _, event := range events {
+					for key, value := range properties {
+						event.Properties[key] = value
+					}
+				}
+				return events
+			}
+			missing, err := checkTelemetryManifest(expected, makeEvents())
+			require.NoError(t, err)
+			require.Empty(t, missing)
+			for key := range properties {
+				for index := range 2 {
+					events := makeEvents()
+					events[index].Properties[key] = "wrong"
+					_, err := checkTelemetryManifest(expected, events)
+					require.ErrorContains(t, err, "property "+key+" mismatch")
+				}
+			}
+		})
+	}
+}
+
+func TestTelemetryConcurrentLogRegistration(t *testing.T) {
+	environment := &AzCopyEnvironmentContext{mu: &sync.Mutex{}}
+	var workers sync.WaitGroup
+	for index := range 100 {
+		workers.Add(1)
+		go func() { defer workers.Done(); environment.RegisterLogUpload(LogUpload{RunID: uint(index)}) }()
+	}
+	workers.Wait()
+	require.Len(t, environment.LogUploads, 100)
+	seen := map[uint]bool{}
+	for _, entry := range environment.LogUploads {
+		seen[entry.RunID] = true
+	}
+	require.Len(t, seen, 100)
 }
 
 type manifestQueryStub struct {
@@ -244,6 +363,8 @@ func TestTelemetryManifestRegistration(t *testing.T) {
 	jobID := common.NewJobID()
 	summary := common.ListJobSummaryResponse{
 		JobID: jobID, JobStatus: common.EJobStatus.Completed(), TotalBytesTransferred: 123, TransfersCompleted: 2,
+		FileTransfers: 1, FolderPropertyTransfers: 1, FoldersCompleted: 1, StorageHTTPAttemptCount: 7, PercentComplete: 100,
+		SymlinkTransfers: 2, HardlinksConvertedCount: 3, NetworkErrorAttemptCount: 4, ServerBusy503Count: 5,
 	}
 	capture := newAzCopyJobIDCapture(&AzCopyRawStdout{})
 	_, err := capture.Write([]byte("Job " + jobID.String() + " has started\n"))
@@ -263,6 +384,17 @@ func TestTelemetryManifestRegistration(t *testing.T) {
 	assert.Equal(t, "Blob", attempt.Properties["SourceType"])
 	assert.Equal(t, "Completed", attempt.FinishedProperties["JobStatus"])
 	assert.Equal(t, float64(123), attempt.Measurements["azcopy.bytes_transferred"])
+	assert.Equal(t, float64(1), attempt.Measurements["azcopy.folder_properties_scheduled"])
+	assert.Equal(t, float64(1), attempt.Measurements["azcopy.objects_completed"])
+	assert.Equal(t, float64(7), attempt.Measurements["azcopy.storage_http_attempt_count"])
+	assert.Equal(t, float64(2), attempt.Measurements["azcopy.symlinks_scheduled"])
+	assert.Equal(t, float64(3), attempt.Measurements["azcopy.hardlinks_converted_scheduled"])
+	assert.Equal(t, float64(4), attempt.Measurements["azcopy.network_error_attempt_count"])
+	assert.Equal(t, float64(5), attempt.Measurements["azcopy.server_busy_503_count"])
+	assert.Equal(t, float64(100), attempt.Measurements["azcopy.percent_complete"])
+	assert.Equal(t, jobID.String(), attempt.InstallationGroup)
+	assert.Contains(t, attempt.AbsentMeasurements, "azcopy.job_throughput_mbps")
+	assert.Contains(t, attempt.AbsentMeasurements, "azcopy.transfer_phase_throughput_mbps")
 	environment, first := telemetryProcessEnvironment([]string{"KEEP=yes", "AZCOPY_E2E_TELEMETRY_RUN_ID=old", "azcopy_e2e_telemetry_run_id=other"}, "run")
 	_, second := telemetryProcessEnvironment(nil, "run")
 	assert.NotEqual(t, first, second)
@@ -295,4 +427,183 @@ func TestTelemetryManifestOptOut(t *testing.T) {
 	client = &manifestQueryStub{errors: []error{errors.New("forbidden")}}
 	verifier.queryClient = client
 	assert.Error(t, verifier.Verify(context.Background(), "workspace", "run", time.Now(), expected))
+}
+
+func TestTelemetryExistingWorkflowAssertions(t *testing.T) {
+	resetAppInsightsValidation()
+	t.Cleanup(resetAppInsightsValidation)
+	jobID := common.NewJobID()
+	summary := common.ListJobSummaryResponse{
+		JobID: jobID, JobStatus: common.EJobStatus.Cancelled(),
+		TotalTransfers: 8, FileTransfers: 3, FolderPropertyTransfers: 2, SymlinkTransfers: 1, HardlinksConvertedCount: 2,
+		TransfersCompleted: 3, FoldersCompleted: 1, TransfersFailed: 2, FoldersFailed: 1, TransfersSkipped: 1,
+		TotalBytesTransferred: 100, TotalBytesExpected: 200, TotalBytesEnumerated: 400, PercentComplete: 50,
+		StorageHTTPAttemptCount: 11, NetworkErrorAttemptCount: 2,
+	}
+	registerTelemetryExpectation("copy", jobID.String(), AzCopyVerbCopy, &summary, "File", "Local")
+	summary.JobStatus = common.EJobStatus.Completed()
+	summary.TotalBytesTransferred, summary.PercentComplete = 200, 100
+	registerTelemetryExpectation("resume", jobID.String(), AzCopyVerbJobsResume, &summary, "File", "Local")
+	expected := snapshotAppInsightsValidation().expectedAttempts
+	makeEvents := func() []observedTelemetryEvent {
+		var events []observedTelemetryEvent
+		for _, attempt := range expected {
+			for _, name := range []string{"azcopy.job.started", "azcopy.job.finished"} {
+				event := manifestEvent(attempt.ProcessRunID, attempt.ProcessRunID+"-invocation", name)
+				event.Properties["JobID"], event.Properties["Command"] = attempt.JobID, attempt.Command
+				for key, value := range attempt.Properties {
+					event.Properties[key] = value
+				}
+				if name == "azcopy.job.finished" {
+					for key, value := range attempt.FinishedProperties {
+						event.Properties[key] = value
+					}
+					for key, value := range attempt.Measurements {
+						event.Measurements[key] = value
+					}
+				}
+				events = append(events, event)
+			}
+		}
+		return events
+	}
+	require.Equal(t, float64(6), expected[0].Measurements["azcopy.objects_scheduled"])
+	require.Equal(t, float64(2), expected[0].Measurements["azcopy.objects_completed"])
+	require.Equal(t, float64(1), expected[0].Measurements["azcopy.objects_failed"])
+	missing, err := checkTelemetryManifest(expected, makeEvents())
+	require.NoError(t, err)
+	require.Empty(t, missing)
+	for _, key := range []string{"azcopy.folder_properties_failed", "azcopy.hardlinks_converted_scheduled", "azcopy.network_error_attempt_count", "azcopy.percent_complete"} {
+		events := makeEvents()
+		events[1].Measurements[key]++
+		_, err := checkTelemetryManifest(expected, events)
+		require.ErrorContains(t, err, "measurement "+key)
+	}
+	events := makeEvents()
+	events[2].Properties["InstallationID"] = "different-home"
+	_, err = checkTelemetryManifest(expected, events)
+	require.ErrorContains(t, err, "installation ID changed")
+	events = makeEvents()
+	events[3].Measurements["azcopy.job_throughput_mbps"] = 99
+	_, err = checkTelemetryManifest(expected, events)
+	require.ErrorContains(t, err, "unexpected measurement")
+}
+
+func TestTelemetryCancellationTerminalConstraints(t *testing.T) {
+	resetAppInsightsValidation()
+	t.Cleanup(resetAppInsightsValidation)
+	summary := common.ListJobSummaryResponse{JobID: common.NewJobID(), JobStatus: common.EJobStatus.Cancelled(), PercentComplete: 25}
+	constraints := cancelledTransferTelemetry("private-root")
+	registerTelemetryExpectation("cancel", summary.JobID.String(), AzCopyVerbCopy, &summary, "File", "Local", constraints)
+	expected := snapshotAppInsightsValidation().expectedAttempts
+	makeEvents := func(stage string) []observedTelemetryEvent {
+		events := []observedTelemetryEvent{
+			manifestEvent("cancel", "invocation", "azcopy.job.started"),
+			manifestEvent("cancel", "invocation", "azcopy.job.finished"),
+		}
+		for _, event := range events {
+			event.Properties["JobID"] = summary.JobID.String()
+			for key, value := range expected[0].Properties {
+				event.Properties[key] = value
+			}
+		}
+		for key, value := range expected[0].FinishedProperties {
+			events[1].Properties[key] = value
+		}
+		for key, value := range expected[0].Measurements {
+			events[1].Measurements[key] = value
+		}
+		events[1].Properties["TerminalStage"] = stage
+		return events
+	}
+	for _, stage := range []string{"enumeration", "transfer", "completion"} {
+		missing, err := checkTelemetryManifest(expected, makeEvents(stage))
+		require.NoError(t, err)
+		require.Empty(t, missing)
+	}
+	for _, stage := range []string{"", "initialization", "completed", "finalization"} {
+		_, err := checkTelemetryManifest(expected, makeEvents(stage))
+		require.ErrorContains(t, err, "unexpected terminal stage")
+	}
+	for _, key := range []string{"JobStatus", "JobErrorCategory", "JobErrorCode"} {
+		events := makeEvents("completion")
+		events[1].Properties[key] = "unexpected"
+		_, err := checkTelemetryManifest(expected, events)
+		require.ErrorContains(t, err, "terminal property "+key)
+	}
+	for _, percent := range []float64{-1, 100, 101, math.NaN(), math.Inf(1)} {
+		events := makeEvents("completion")
+		events[1].Measurements["azcopy.percent_complete"] = percent
+		_, err := checkTelemetryManifest(expected, events)
+		require.ErrorContains(t, err, "incomplete progress")
+	}
+	events := makeEvents("completion")
+	delete(events[1].Measurements, "azcopy.percent_complete")
+	_, err := checkTelemetryManifest(expected, events)
+	require.ErrorContains(t, err, "incomplete progress")
+	events = makeEvents("completion")
+	events[1].Properties["RawError"] = "private-root/file.bin"
+	_, err = checkTelemetryManifest(expected, events)
+	require.ErrorContains(t, err, "private value")
+	require.NoError(t, validateTelemetryTerminalSummary(constraints, &summary))
+	require.ErrorContains(t, validateTelemetryTerminalSummary(constraints, nil), "final summary")
+	withoutID := summary
+	withoutID.JobID = common.JobID{}
+	require.ErrorContains(t, validateTelemetryTerminalSummary(constraints, &withoutID), "job ID")
+	summary.JobStatus = common.EJobStatus.Failed()
+	require.ErrorContains(t, validateTelemetryTerminalSummary(constraints, &summary), "terminal status")
+	summary.JobStatus, summary.PercentComplete = common.EJobStatus.Cancelled(), 100
+	require.ErrorContains(t, validateTelemetryTerminalSummary(constraints, &summary), "incomplete progress")
+	require.NoError(t, validateTelemetryTerminalSummary(nil, nil))
+	require.NoError(t, validateTelemetryTerminalSummary(&telemetryExpectation{NoEvents: true}, nil))
+}
+
+func TestTelemetrySkipFailureTerminalConstraints(t *testing.T) {
+	for _, test := range []struct {
+		name, status, stage, category, code string
+		failed, skipped                     float64
+	}{
+		{"skipped", "CompletedWithSkipped", "completed", "", "", 0, 1},
+		{"failed summary", "Failed", "completion", "completion", "completion-error", 1, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			expected := []telemetryExpectation{{
+				ProcessRunID: "process", JobID: "job", Command: "copy",
+				FinishedProperties: map[string]string{
+					"JobStatus": test.status, "TerminalStage": test.stage,
+					"JobErrorCategory": test.category, "JobErrorCode": test.code,
+				},
+				Measurements: map[string]float64{
+					"azcopy.transfers_total": 1, "azcopy.transfers_completed": 0,
+					"azcopy.transfers_failed": test.failed, "azcopy.transfers_skipped": test.skipped,
+					"azcopy.bytes_transferred": 0,
+				},
+			}}
+			makeEvents := func() []observedTelemetryEvent {
+				events := []observedTelemetryEvent{manifestEvent("process", "invocation", "azcopy.job.started"), manifestEvent("process", "invocation", "azcopy.job.finished")}
+				for key, value := range expected[0].FinishedProperties {
+					events[1].Properties[key] = value
+				}
+				for key, value := range expected[0].Measurements {
+					events[1].Measurements[key] = value
+				}
+				return events
+			}
+			missing, err := checkTelemetryManifest(expected, makeEvents())
+			require.NoError(t, err)
+			require.Empty(t, missing)
+			for key := range expected[0].FinishedProperties {
+				events := makeEvents()
+				events[1].Properties[key] = "wrong"
+				_, err := checkTelemetryManifest(expected, events)
+				require.ErrorContains(t, err, "terminal property "+key)
+			}
+			for key := range expected[0].Measurements {
+				events := makeEvents()
+				events[1].Measurements[key]++
+				_, err := checkTelemetryManifest(expected, events)
+				require.ErrorContains(t, err, "measurement "+key)
+			}
+		})
+	}
 }

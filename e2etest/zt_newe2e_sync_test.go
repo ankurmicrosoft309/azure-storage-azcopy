@@ -246,6 +246,12 @@ func (s *SyncTestSuite) Scenario_TestSyncDeleteDestinationIfNecessary(svm *Scena
 	stdout, _ := RunAzCopy(svm, AzCopyCommand{
 		Verb:    AzCopyVerbSync,
 		Targets: []ResourceManager{srcRes, dstRes},
+		Telemetry: &telemetryExpectation{Measurements: map[string]float64{
+			"azcopy.source_objects_scanned":     2,
+			"azcopy.source_bytes_scanned":       2048,
+			"azcopy.source_max_directory_depth": 0,
+			"azcopy.bytes_enumerated":           1024,
+		}},
 		Flags: SyncFlags{
 			DeleteIfNecessary: pointerTo(true),
 		},

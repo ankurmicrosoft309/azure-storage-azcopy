@@ -134,7 +134,7 @@ func (envCtx *AzCopyEnvironmentContext) RegisterEnvironment(env *AzCopyEnvironme
 
 func (envCtx *AzCopyEnvironmentContext) RegisterLogUpload(upload LogUpload) {
 	envCtx.mu.Lock()
-	envCtx.mu.Unlock()
+	defer envCtx.mu.Unlock()
 
 	envCtx.LogUploads = append(envCtx.LogUploads, upload)
 }

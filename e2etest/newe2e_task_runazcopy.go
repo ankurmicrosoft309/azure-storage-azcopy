@@ -82,6 +82,7 @@ const ( // initially supporting a limited set of verbs
 	AzCopyVerbJobsClean   AzCopyVerb = "jobs clean"
 	AzCopyVerbJobsRemove  AzCopyVerb = "jobs remove"
 	AzCopyVerbJobsShow    AzCopyVerb = "jobs show"
+	AzCopyVerbBenchmark   AzCopyVerb = "bench"
 )
 
 type AzCopyTarget struct {
@@ -130,7 +131,10 @@ type AzCopyCommand struct {
 	// If Stdout is nil, a sensible default is picked in place.
 	Stdout AzCopyStdout
 
-	ShouldFail bool
+	ShouldFail       bool
+	Timeout          time.Duration
+	WorkingDirectory string
+	Telemetry        *telemetryExpectation
 
 	// AfterStart, if non-nil, is called after the azcopy process has been
 	// started but before Wait.  The callback receives the process's stdin
@@ -153,7 +157,11 @@ type AzCopyEnvironment struct {
 	AzureTenantId           *string `env:"AZURE_TENANT_ID"`
 	AzureClientId           *string `env:"AZURE_CLIENT_ID"`
 
-	LoginCacheName *string `env:"AZCOPY_LOGIN_CACHE_NAME"`
+	LoginCacheName            *string `env:"AZCOPY_LOGIN_CACHE_NAME"`
+	DisableTelemetry          *bool   `env:"AZCOPY_DISABLE_TELEMETRY"`
+	TelemetryConnectionString *string `env:"AZCOPY_TELEMETRY_CONNECTION_STRING"`
+	UserProfile               *string `env:"USERPROFILE"`
+	Home                      *string `env:"HOME"`
 
 	// InheritEnvironment is a lowercase list of environment variables to always inherit.
 	// Specifying "*" as an entry with the value "true" will act as a wildcard, and inherit all env vars.
@@ -425,8 +433,11 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 			} else {
 				for _, v := range os.Environ() {
 					key := v[:strings.Index(v, "=")]
-
-					if ieMap[strings.ToLower(key)] {
+					overridden := false
+					for configured := range envMap {
+						overridden = overridden || strings.EqualFold(key, configured)
+					}
+					if ieMap[strings.ToLower(key)] && !overridden {
 						out = append(out, v)
 					}
 				}
@@ -514,14 +525,17 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 		env, processRunID = telemetryProcessEnvironment(env, snapshotAppInsightsValidation().runID)
 	}
 	jobIDCapture := newAzCopyJobIDCapture(out)
-	command := exec.Cmd{
-		Path: GlobalConfig.AzCopyExecutableConfig.ExecutablePath,
-		Args: args,
-		Env:  env,
-
-		Stdout: jobIDCapture,
-		Stderr: stderr,
+	jobIDCapture.firstJobOnly = commandSpec.Verb == AzCopyVerbBenchmark
+	processContext := a.Context()
+	if commandSpec.Timeout > 0 {
+		var cancel context.CancelFunc
+		processContext, cancel = context.WithTimeout(processContext, commandSpec.Timeout)
+		defer cancel()
 	}
+	command := exec.CommandContext(processContext, GlobalConfig.AzCopyExecutableConfig.ExecutablePath)
+	command.Args, command.Env = args, env
+	command.Dir = commandSpec.WorkingDirectory
+	command.Stdout, command.Stderr = jobIDCapture, stderr
 	in, err := command.StdinPipe()
 	a.NoError("get stdin pipe", err)
 
@@ -566,12 +580,14 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 		Stderr: stderr.String(),
 	})
 
+	a.NoError("validate explicit terminal scenario summary", validateTelemetryTerminalSummary(commandSpec.Telemetry, jobIDCapture.FinalSummary()))
 	validationDecision := decideAppInsightsJobValidation(
 		commandSpec.Verb,
 		flagMap,
 		commandSpec.ShouldFail,
 		jobIDCapture.JobID())
 	noTelemetryExpected := telemetryExpectsNoEvents(commandSpec.Verb, flagMap, env)
+	noTelemetryExpected = noTelemetryExpected || (commandSpec.Telemetry != nil && commandSpec.Telemetry.NoEvents)
 	if noTelemetryExpected {
 		validationDecision = appInsightsJobValidationDecision{}
 	}
@@ -583,10 +599,12 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 	if AppInsightsTelemetryValidationEnabled() {
 		if noTelemetryExpected {
 			registerNoTelemetryExpectation(processRunID)
+		} else if commandSpec.Telemetry != nil && commandSpec.Telemetry.CommandOnly {
+			registerCommandTelemetryExpectation(processRunID, commandSpec.Verb, commandSpec.Telemetry)
 		} else if validationDecision.jobID != "" {
 			sourceType, destType, endpointErr := telemetryEndpointTypes(targetArgs, flagMap)
 			a.NoError("derive telemetry endpoint types from CLI inputs", endpointErr)
-			registerTelemetryExpectation(processRunID, validationDecision.jobID, commandSpec.Verb, jobIDCapture.FinalSummary(), sourceType, destType)
+			registerTelemetryExpectation(processRunID, validationDecision.jobID, commandSpec.Verb, jobIDCapture.FinalSummary(), sourceType, destType, commandSpec.Telemetry)
 			logTelemetryDeliveryEvidence(a, processRunID, validationDecision.jobID,
 				filepath.Join(*commandSpec.Environment.LogLocation, validationDecision.jobID+".log"), stderr.String())
 		}
@@ -597,7 +615,7 @@ func RunAzCopy(a ScenarioAsserter, commandSpec AzCopyCommand) (AzCopyStdout, *Az
 
 func azCopyVerbProducesJobFinishedTelemetry(verb AzCopyVerb) bool {
 	switch verb {
-	case AzCopyVerbCopy, AzCopyVerbSync, AzCopyVerbJobsResume:
+	case AzCopyVerbCopy, AzCopyVerbSync, AzCopyVerbJobsResume, AzCopyVerbBenchmark:
 		return true
 	default:
 		return false
