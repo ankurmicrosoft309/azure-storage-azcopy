@@ -64,6 +64,17 @@ func (s *BasicFunctionalitySuite) Scenario_SingleFile(svm *ScenarioVariationMana
 		svm,
 		AzCopyCommand{
 			Verb: azCopyVerb,
+			Telemetry: &telemetryExpectation{
+				Properties: map[string]string{
+					"FromTo":              common.FromToValue(srcObj.Location(), dstObj.Location()).String(),
+					"SourceAuthMechanism": common.Iff(srcObj.Location().IsLocal(), "NotApplicable", "SAS"),
+					"DestAuthMechanism":   common.Iff(dstObj.Location().IsLocal(), "NotApplicable", "SAS"),
+					"SourceCloudType":     common.Iff(srcObj.Location().IsLocal(), "", "public"),
+					"DestCloudType":       common.Iff(dstObj.Location().IsLocal(), "", "public"),
+				},
+				Measurements:    map[string]float64{"azcopy.source_objects_scanned": 1, "azcopy.source_bytes_scanned": float64(SizeFromString("10K")), "azcopy.source_max_directory_depth": 0},
+				ForbiddenValues: []string{srcObj.URI(GetURIOptions{}), dstObj.URI(GetURIOptions{}), "sig="},
+			},
 			Targets: []ResourceManager{
 				TryApplySpecificAuthType(srcObj, EExplicitCredentialType.SASToken(), svm, CreateAzCopyTargetOptions{
 					SASTokenOptions: sasOpts,
@@ -130,6 +141,11 @@ func (s *BasicFunctionalitySuite) Scenario_MultiFileUploadDownload(svm *Scenario
 		AzCopyCommand{
 			// Sync is not included at this moment, because sync requires
 			Verb: azCopyVerb,
+			Telemetry: &telemetryExpectation{Measurements: map[string]float64{
+				"azcopy.source_objects_scanned":     3,
+				"azcopy.source_bytes_scanned":       float64(3 * SizeFromString("10K")),
+				"azcopy.source_max_directory_depth": 0,
+			}},
 			Targets: []ResourceManager{
 				TryApplySpecificAuthType(srcContainer, EExplicitCredentialType.SASToken(), svm, CreateAzCopyTargetOptions{
 					SASTokenOptions: sasOpts,
@@ -820,6 +836,18 @@ func (s *BasicFunctionalitySuite) Scenario_JobResume(svm *ScenarioVariationManag
 		},
 		ShouldFail:  true,
 		Environment: env,
+		Telemetry: &telemetryExpectation{
+			Properties: map[string]string{"SourceAuthMechanism": "NotApplicable", "DestAuthMechanism": "OAuth"},
+			FinishedProperties: map[string]string{
+				"JobStatus": "Failed", "TerminalStage": "completion",
+				"JobErrorCategory": "completion", "JobErrorCode": "completion-error",
+			},
+			Measurements: map[string]float64{
+				"azcopy.transfers_total": 1, "azcopy.transfers_completed": 0,
+				"azcopy.transfers_failed": 1, "azcopy.transfers_skipped": 0, "azcopy.bytes_transferred": 0,
+			},
+			ForbiddenValues: []string{srcObj.URI(GetURIOptions{}), dstContainer.URI(GetURIOptions{})},
+		},
 	})
 
 	// Assertions to check if above copy job failed with final status Failed
@@ -849,6 +877,17 @@ func (s *BasicFunctionalitySuite) Scenario_JobResume(svm *ScenarioVariationManag
 			Verb:           AzCopyVerbJobsResume,
 			PositionalArgs: []string{jobId},
 			Environment:    env,
+			Telemetry: &telemetryExpectation{
+				FinishedProperties: map[string]string{
+					"JobStatus": "Completed", "TerminalStage": "completed", "JobErrorCategory": "", "JobErrorCode": "",
+					"ThroughputStatus": "unavailable-cumulative-summary",
+				},
+				Measurements: map[string]float64{
+					"azcopy.transfers_total": 1, "azcopy.transfers_completed": 1,
+					"azcopy.transfers_failed": 0, "azcopy.transfers_skipped": 0,
+					"azcopy.bytes_transferred": float64(SizeFromString("10M")), "azcopy.percent_complete": 100,
+				},
+			},
 		})
 
 	// Assertions to check if JobResume succeeded

@@ -22,12 +22,18 @@ type azCopyJobIDCapture struct {
 	pending      string
 	jobID        string
 	finalSummary *common.ListJobSummaryResponse
+	summaries    []common.ListJobSummaryResponse
 	onJobID      func()
+	firstJobOnly bool
 }
 
 func newAzCopyJobIDCapture(target AzCopyStdout) *azCopyJobIDCapture {
 	return &azCopyJobIDCapture{target: target}
 }
+
+func (c *azCopyJobIDCapture) RawStdout() []string { return c.target.RawStdout() }
+
+func (c *azCopyJobIDCapture) String() string { return c.target.String() }
 
 func (c *azCopyJobIDCapture) Write(p []byte) (int, error) {
 	n, err := c.target.Write(p)
@@ -79,11 +85,24 @@ func (c *azCopyJobIDCapture) FinalSummary() *common.ListJobSummaryResponse {
 	return &summary
 }
 
+func (c *azCopyJobIDCapture) Summaries() []common.ListJobSummaryResponse {
+	c.capture("", true)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]common.ListJobSummaryResponse(nil), c.summaries...)
+}
+
 func (c *azCopyJobIDCapture) captureLine(line string) bool {
 	var output cmd.JsonOutputTemplate
 	if json.Unmarshal([]byte(line), &output) == nil && output.MessageType == cmd.EOutputMessageType.EndOfJob().String() {
 		var summary common.ListJobSummaryResponse
 		if json.Unmarshal([]byte(output.MessageContent), &summary) == nil && !summary.JobID.IsEmpty() {
+			if c.firstJobOnly {
+				c.summaries = append(c.summaries, summary)
+			}
+			if c.firstJobOnly && c.jobID != "" && c.jobID != summary.JobID.String() {
+				return false
+			}
 			c.finalSummary = &summary
 			return c.setJobID(summary.JobID.String())
 		}
@@ -111,6 +130,9 @@ func (c *azCopyJobIDCapture) captureLine(line string) bool {
 func (c *azCopyJobIDCapture) setJobID(candidate string) bool {
 	jobID, err := common.ParseJobID(candidate)
 	if err != nil {
+		return false
+	}
+	if c.firstJobOnly && c.jobID != "" && c.jobID != candidate {
 		return false
 	}
 

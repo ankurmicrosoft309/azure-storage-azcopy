@@ -94,6 +94,53 @@ func TestTelemetryInitializationFailureFinalization(t *testing.T) {
 	}
 }
 
+func TestTelemetryTerminalSummaryOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name, stage, wantStage, category, code string
+		status                                 common.JobStatus
+	}{
+		{"skipped", "completion", "completed", "", "", common.EJobStatus.CompletedWithSkipped()},
+		{"failed summary", "completion", "completion", "completion", "completion-error", common.EJobStatus.Failed()},
+		{"resumed success", "completion", "completed", "", "", common.EJobStatus.Completed()},
+		{"cancelled enumeration", "enumeration", "enumeration", "", "", common.EJobStatus.Cancelled()},
+		{"cancelled transfer", "transfer", "transfer", "", "", common.EJobStatus.Cancelled()},
+		{"cancelled completion", "completion", "completion", "", "", common.EJobStatus.Cancelled()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &failurePolicyClient{}
+			agent := failureTestAgent(client)
+			finalizer := newAttemptTelemetryFinalizer(agent, telemetry.JobDimensions{Command: "copy"}, "job", "attempt", time.Now())
+			finalizer.setStage(test.stage)
+			finalizer.setFinalSummary(common.ListJobSummaryResponse{JobStatus: test.status, PercentComplete: 25})
+			finalizer.startEvent()
+			finalizer.finish(nil)
+			finalizer.finish(errors.New("must-not-overwrite-terminal-result"))
+			agent.flush(time.Second)
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			require.Len(t, client.bodies, 2)
+			var batch []struct {
+				Data struct {
+					BaseData struct {
+						Name         string
+						Properties   map[string]string
+						Measurements map[string]float64
+					}
+				}
+			}
+			require.NoError(t, json.Unmarshal([]byte(client.bodies[1]), &batch))
+			require.Len(t, batch, 1)
+			event := batch[0].Data.BaseData
+			require.Equal(t, "azcopy.job.finished", event.Name)
+			require.Equal(t, test.status.String(), event.Properties["JobStatus"])
+			require.Equal(t, test.wantStage, event.Properties["TerminalStage"])
+			require.Equal(t, test.category, event.Properties["JobErrorCategory"])
+			require.Equal(t, test.code, event.Properties["JobErrorCode"])
+			require.EqualValues(t, 25, event.Measurements["azcopy.percent_complete"])
+		})
+	}
+}
+
 func TestTelemetryCollectionPanicsDoNotEscape(t *testing.T) {
 	agent := initializeTelemetryAgent(func() *telemetryAgent { panic("metadata-private-canary") })
 	assert.False(t, agent.enabled)

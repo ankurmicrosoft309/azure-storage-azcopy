@@ -48,6 +48,32 @@ These are offline unit checks. They do not launch the credential-dependent cloud
 
 Unit-level integration tests use the real reporter/dispatcher with local `httptest` endpoints for rejection, partial acceptance, 429/503 throttling, and concurrent-request cancellation. DNS, TLS, and offline failures are injected through the HTTP transport; a blocked client exercises deadline expiry. Tests verify a queued finish never reaches the endpoint after a failed start, later events remain disabled even if the endpoint would recover, existing collectors stop, and healthy ingestion still reports failed transfers. Reporter tests verify typed classification through both backends and preserve safe diagnostics. No Application Insights resource, credentials, or ingestion polling is required for these policy tests.
 
+## Functional Azure E2E
+
+Telemetry assertions extend existing `TestNewE2E` workflows, including basic
+copy/sync, selective sync, failed-job resume, NFS cancellation, dry-runs, jobs list
+and OAuth transfers. They use the same account registry, resource cleanup,
+SAS/OAuth credentials and Application Insights ingestion/query configuration.
+The pipeline identity is the `azcopytestworkloadidentity` service connection, not
+the local interactive user. There is no separate account or role-grant path.
+
+After loading the normal New_E2E configuration and building `NEW_E2E_AZCOPY_PATH`,
+run `./testSuite/telemetry-cli-e2e.ps1`. It selects the reused scenarios plus the
+remaining missing-flow cases, using the normal three-hour E2E budget. Normal
+New_E2E pipeline runs also discover them. Only command exclusions, transfer
+opt-outs, benchmark download/verified cleanup and coordinated installation
+identity remain in `TelemetryFunctionalSuite`; duplicate copy/sync, jobs-list,
+dry-run and cancellation/resume fixtures were removed. Assertions query real Azure-ingested events; exclusion cases
+observe the existing five-minute absence window. These are real Azure operations.
+
+`./testSuite/telemetry-cli-integration.ps1` separately runs the retained loopback
+fault/payload tests. Those require `telemetrylive` and the integration-only opt-in,
+not Azure resources. They must not be reported as Azure E2E passes.
+
+See [scenario coverage](SCENARIO_COVERAGE.md) for implemented scenarios, execution
+status and the remaining Word-document rows. The converted Azure suite has not
+yet completed a live run with the configured New_E2E identity.
+
 ## Manual Real-Endpoint Fault Tests
 
 See [manual live testing](LIVE_TESTING.md) for real Application Insights quota and
@@ -64,7 +90,7 @@ The separate [performance pipeline](../telemetry-performance.yml) has no push, P
 
 When Application Insights verification is enabled, each child process receives a unique `AZCOPY_E2E_TELEMETRY_RUN_ID` under the configured run ID. The root run ID is limited to 80 bytes to leave room for that suffix.
 
-The manifest derives JobID, command, and endpoint types from the harness, and available terminal counters/status from synchronous JSON stdout capture. It requires exactly one start and one finish per expected process, nonempty and matching installation/invocation IDs within a pair, and invocation IDs unique across processes. It checks schema, supplied dimensions, lifecycle counters, resume cumulative scope, and supplied terminal counters/status. A repeated JobID cannot satisfy a missing resume process. Arrival order is not constrained.
+The manifest derives JobID, command, and endpoint types from the harness, and available terminal counters/status from synchronous JSON stdout capture. It requires exactly one start and one finish per expected job process, or exactly one command.invoked for explicit command-only expectations. It checks nonempty matching identities within each pair, unique InvocationIDs across processes, and stable InstallationID across attempts of the same JobID. Every captured job summary now reconciles bytes, objects/folders by outcome, symlinks, converted hardlinks, HTTP/network/server-busy counts, IOPS and percent complete. Resume requires cumulative scope and absent attempt-throughput metrics. Supplied fixture dimensions, source shape, privacy and terminal expectations add independent assertions. A repeated JobID cannot satisfy a missing resume process. Arrival order is not constrained.
 
 InvocationID and InstallationID are validated from observed events, not independently predicted by the harness. Text-only output without a JSON final summary cannot provide exact terminal counter expectations. Missing pairs are polled within a bounded query context; duplicates and inconsistent data in a returned snapshot fail immediately. Duplicates arriving after successful verification are outside that observation window. This verifies delivery in the E2E environment, not a production delivery guarantee.
 
